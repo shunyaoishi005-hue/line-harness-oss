@@ -8,6 +8,7 @@ import {
   getRandomPoolAccount,
   getPoolAccounts,
   getEntryRouteByRefCode,
+  recordRefTracking,
 } from '@line-crm/db';
 import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts, processQueuedBroadcasts } from './services/broadcast.js';
@@ -68,6 +69,7 @@ import { resolveCorsOrigin } from './middleware/admin-auth-config.js';
 import booking from './routes/booking.js';
 import events from './routes/events.js';
 import { trafficPools } from './routes/traffic-pools.js';
+import { isLinkPreviewBot } from './lib/og-bot.js';
 import { meetCallback } from './routes/meet-callback.js';
 import { messageTemplates } from './routes/message-templates.js';
 import dedupPreview from './routes/dedup-preview.js';
@@ -226,20 +228,37 @@ app.get('/r/:ref', async (c) => {
   //   1. entry_route.pool_id (if ref maps to a referral link)
   //   2. URL query ?pool=
   //   3. 'main' fallback
-  let liffUrl = c.env.LIFF_URL;
+  let liffUrl = c.env.LIFF_URL || '';
   let pool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
 
   // 1. entry_route lookup. getTrafficPoolById (unlike getTrafficPoolBySlug)
   // does not filter on is_active, so we ignore disabled pools explicitly to
   // honor the operator's pause action.
-  //
-  // NOTE: we intentionally do NOT record a ref_tracking row here. The
-  // /auth/callback + /api/liff/link path already writes a tracking row when
-  // OAuth/LIFF completes, and writing a second landing-page row would
-  // double-count every successful click in getEntryRouteFunnel. Landing-page
-  // drop-off (clicks that never reach OAuth) is therefore not visible in the
-  // funnel; that limitation is intentional pending a dedicated click table.
   const route = await getEntryRouteByRefCode(c.env.DB, ref);
+  let refTrackingId = '';
+  const ua = c.req.header('user-agent') || '';
+  if (route && !isLinkPreviewBot(ua)) {
+    try {
+      const tracking = await recordRefTracking(c.env.DB, {
+        refCode: ref,
+        friendId: null,
+        entryRouteId: route.id,
+        sourceUrl: c.req.header('Referer') || c.req.url,
+        fbclid: c.req.query('fbclid') || null,
+        gclid: c.req.query('gclid') || null,
+        twclid: c.req.query('twclid') || null,
+        ttclid: c.req.query('ttclid') || null,
+        utmSource: c.req.query('utm_source') || null,
+        utmMedium: c.req.query('utm_medium') || null,
+        utmCampaign: c.req.query('utm_campaign') || null,
+        userAgent: ua || null,
+        ipAddress: c.req.header('CF-Connecting-IP') || null,
+      });
+      refTrackingId = tracking.id;
+    } catch (err) {
+      console.error('Failed to record /r click:', err);
+    }
+  }
   if (route?.pool_id) {
     const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
     if (candidate?.is_active) pool = candidate;
@@ -263,11 +282,19 @@ app.get('/r/:ref', async (c) => {
     }
   }
 
+  if (!liffUrl) {
+    const authParams = new URLSearchParams(new URL(c.req.url).search);
+    authParams.set('ref', ref);
+    if (refTrackingId) authParams.set('rt', refTrackingId);
+    return c.redirect(`/auth/line?${authParams.toString()}`, 302);
+  }
+
   // Build LIFF URL with params (direct link for Universal Link)
   const liffIdMatch = liffUrl.match(/liff\.line\.me\/([0-9]+-[A-Za-z0-9]+)/);
   const liffParams = new URLSearchParams();
   if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
   if (ref) liffParams.set('ref', ref);
+  if (refTrackingId) liffParams.set('rt', refTrackingId);
   if (formId) liffParams.set('form', formId);
   const gate = c.req.query('gate');
   if (gate) liffParams.set('gate', gate);
@@ -275,6 +302,10 @@ app.get('/r/:ref', async (c) => {
   if (xh) liffParams.set('xh', xh);
   const ig = c.req.query('ig');
   if (ig) liffParams.set('ig', ig);
+  for (const key of ['gclid', 'fbclid', 'twclid', 'ttclid', 'utm_source', 'utm_medium', 'utm_campaign']) {
+    const value = c.req.query(key);
+    if (value) liffParams.set(key, value);
+  }
   const liffTarget = liffParams.toString() ? `${liffUrl}?${liffParams.toString()}` : liffUrl;
 
   // Help link carries the *resolved* liff target as `t=` so the help page
@@ -284,10 +315,10 @@ app.get('/r/:ref', async (c) => {
   // account than the one originally chosen for this user.
   const helpUrl = `/r/${encodeURIComponent(ref)}/help?t=${encodeURIComponent(liffTarget)}`;
 
-  const ua = (c.req.header('user-agent') || '').toLowerCase();
-  const isMobile = /iphone|ipad|android|mobile/.test(ua);
-  const isIOS = /iphone|ipad|ipod/.test(ua);
-  const isAndroid = /android/.test(ua);
+  const uaLower = ua.toLowerCase();
+  const isMobile = /iphone|ipad|android|mobile/.test(uaLower);
+  const isIOS = /iphone|ipad|ipod/.test(uaLower);
+  const isAndroid = /android/.test(uaLower);
 
   if (isMobile) {
     // OS-aware mobile UI. Per-browser detection (X / IG / FB) intentionally avoided —
