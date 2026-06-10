@@ -221,7 +221,16 @@ async function linkAndAddFlow() {
         displayName: profile.displayName,
         existingUuid: existingUuid,
         ref: ref,
+        sourceUrl: window.location.href,
+        gclid: linkParams.get('gclid') || '',
+        fbclid: linkParams.get('fbclid') || '',
+        twclid: linkParams.get('twclid') || '',
+        ttclid: linkParams.get('ttclid') || '',
+        utmSource: linkParams.get('utm_source') || '',
+        utmMedium: linkParams.get('utm_medium') || '',
+        utmCampaign: linkParams.get('utm_campaign') || '',
         ig: linkParams.get('ig') || '',
+        refTrackingId: linkParams.get('rt') || '',
       }),
     }).then(async (res) => {
       if (res.ok) {

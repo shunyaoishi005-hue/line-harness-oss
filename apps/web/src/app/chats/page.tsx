@@ -1,12 +1,14 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { parseStickerMessageContent, stickerFallback } from '@line-crm/shared'
 import { api, fetchApi } from '@/lib/api'
 import { useAccount } from '@/contexts/account-context'
 import Header from '@/components/layout/header'
 import CcPromptButton from '@/components/cc-prompt-button'
 import FlexPreviewComponent from '@/components/flex-preview'
 import FriendInfoSidebar from '@/components/chats/friend-info-sidebar'
+import ImageUploader, { type ImageUploaderValue } from '@/components/shared/image-uploader'
 
 interface Chat {
   id: string
@@ -56,6 +58,24 @@ const statusFilters: { key: StatusFilter; label: string }[] = [
 const SHOW_LOADING_PREF_KEY = 'lh_chat_show_loading_indicator'
 const LOADING_SECONDS_PREF_KEY = 'lh_chat_loading_seconds'
 const LOADING_REFRESH_INTERVAL_MS = 4000
+
+function StickerMessageImage({ content }: { content: string }) {
+  const [failed, setFailed] = useState(false)
+  const sticker = parseStickerMessageContent(content)
+  const fallback = stickerFallback(content)
+
+  if (!sticker || failed) return <span>{fallback}</span>
+
+  return (
+    <img
+      src={sticker.stickerUrl}
+      alt={fallback}
+      className="max-h-[140px] max-w-[140px] object-contain"
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  )
+}
 
 function formatDatetime(iso: string | null): string {
   if (!iso) return '-'
@@ -190,6 +210,9 @@ function DirectMessagePanel({ friendId, friend, onBack, onSent }: {
         return texts.slice(0, 4).join('\n') || '[Flex Message]'
       } catch { return '[Flex Message]' }
     }
+    if (msg.messageType === 'sticker') {
+      return <StickerMessageImage content={msg.content} />
+    }
     return `[${msg.messageType}]`
   }
 
@@ -226,7 +249,7 @@ function DirectMessagePanel({ friendId, friend, onBack, onSent }: {
                   ? 'bg-green-500 text-white'
                   : 'bg-gray-100 text-gray-900'
               }`}>
-                <p className="text-sm whitespace-pre-wrap break-words">{renderContent(msg)}</p>
+                <div className="text-sm whitespace-pre-wrap break-words">{renderContent(msg)}</div>
                 <p className={`text-xs mt-1 ${msg.direction === 'outgoing' ? 'text-green-200' : 'text-gray-400'}`}>
                   {new Date(msg.createdAt).toLocaleString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
                 </p>
@@ -277,12 +300,29 @@ export default function ChatsPage() {
   const [chatDetail, setChatDetail] = useState<ChatDetail | null>(null)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const statusFilterRef = useRef<StatusFilter>('all')
+  const unansweredOnlyRef = useRef(false)
+  const [unansweredOnly, setUnansweredOnly] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return new URLSearchParams(window.location.search).get('unanswered') === '1'
+  })
+
+  // unansweredOnly 変更時に URL を書き戻す
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const urlParams = new URLSearchParams(window.location.search)
+    if (unansweredOnly) urlParams.set('unanswered', '1')
+    else urlParams.delete('unanswered')
+    const qs = urlParams.toString()
+    const url = qs ? `${window.location.pathname}?${qs}` : window.location.pathname
+    window.history.replaceState(null, '', url)
+  }, [unansweredOnly])
   // Send mode: 'enter' = Enter sends, Shift+Enter = newline; 'shift-enter' = reverse
   const [sendMode, setSendMode] = useState<'enter' | 'shift-enter'>('enter')
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState('')
   const [messageContent, setMessageContent] = useState('')
+  const [pendingImage, setPendingImage] = useState<ImageUploaderValue | null>(null)
   const [sending, setSending] = useState(false)
   const sendLockRef = useRef(false)
   const [notes, setNotes] = useState('')
@@ -293,6 +333,7 @@ export default function ChatsPage() {
   const [isMessageInputFocused, setIsMessageInputFocused] = useState(false)
   const isComposingRef = useRef(false)
   const messagesScrollRef = useRef<HTMLDivElement | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
     try {
@@ -321,9 +362,10 @@ export default function ChatsPage() {
     setLoading(true)
     setError('')
     try {
-      const params: { status?: string; accountId?: string } = {}
-      if (statusFilter !== 'all') params.status = statusFilter
+      const params: { status?: string; accountId?: string; unansweredOnly?: boolean } = {}
+      if (statusFilter !== 'all' && !unansweredOnly) params.status = statusFilter
       if (selectedAccountId) params.accountId = selectedAccountId
+      if (unansweredOnly) params.unansweredOnly = true
       const chatRes = await api.chats.list(params)
       if (chatRes.success) {
         setChats(chatRes.data as unknown as Chat[])
@@ -333,7 +375,7 @@ export default function ChatsPage() {
     } finally {
       setLoading(false)
     }
-  }, [statusFilter, selectedAccountId])
+  }, [statusFilter, selectedAccountId, unansweredOnly])
 
   // Friends list (for the "new direct message" modal) — loaded lazily in the background
   // Previously fetched 800 friends in parallel with chats, which blocked the initial render.
@@ -348,8 +390,9 @@ export default function ChatsPage() {
 
   useEffect(() => { void loadAllFriends() }, [loadAllFriends])
 
-  // Keep ref in sync so setChats updater can read the latest filter without stale closure
+  // Keep refs in sync so setChats updater can read the latest filter without stale closure
   useEffect(() => { statusFilterRef.current = statusFilter }, [statusFilter])
+  useEffect(() => { unansweredOnlyRef.current = unansweredOnly }, [unansweredOnly])
 
   // Load/save sendMode preference (guarded — privacy-restricted browsers throw)
   useEffect(() => {
@@ -470,9 +513,18 @@ export default function ChatsPage() {
     }
   }, [chatDetail?.id, chatDetail?.messages?.length])
 
+  // Auto-resize textarea as messageContent grows
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+  }, [messageContent])
+
   const handleSelectChat = (chatId: string) => {
     setSelectedChatId(chatId)
     setMessageContent('')
+    setPendingImage(null)
   }
 
   const triggerLoadingAnimation = useCallback(async (chatId: string) => {
@@ -495,56 +547,114 @@ export default function ChatsPage() {
   }, [showLoadingIndicator, loadingSeconds])
 
   const handleSendMessage = async () => {
-    if (!selectedChatId || !messageContent.trim() || sending || sendLockRef.current) return
-    const content = messageContent.trim()
+    if (!selectedChatId || sending || sendLockRef.current) return
+    if (!messageContent.trim() && !pendingImage) return
     const sendingChatId = selectedChatId  // capture the chat id for this send
     sendLockRef.current = true
     setSending(true)
     try {
-      await api.chats.send(sendingChatId, { content })
-      setMessageContent('')
-      // Optimistic update: append message locally instead of refetching (prevents scroll jump / full reload feel)
       const now = new Date().toISOString()
-      // Only mutate chatDetail if it still corresponds to the chat we just sent to
-      setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
-        ...prev,
-        lastMessageAt: now,
-        status: 'in_progress',
-        messages: [
-          ...(prev.messages ?? []),
-          {
-            id: crypto.randomUUID(),
-            direction: 'outgoing',
-            messageType: 'text',
-            content,
-            createdAt: now,
-          },
-        ],
-      } : prev)
-      setChats((prev) => {
-        // Skip reconciliation if the list no longer contains this chat (e.g. tab changed mid-send)
-        const exists = prev.some((c) => c.id === sendingChatId)
-        if (!exists) return prev
-        const currentFilter = statusFilterRef.current
-        const updated = prev.map((c) => c.id === sendingChatId ? {
-          ...c,
-          lastMessageAt: now,
-          status: 'in_progress' as const,
-          // 一覧の preview も即時更新する。incoming 優先ロジックで上書きされ得るが、
-          // 楽観 UI では「operator が今送った文面」が一瞬見えるのが期待動作。
-          // 次回 loadChats() で server 側の真の最新 (incoming 優先) に reconcile される。
-          lastMessageContent: content,
-          lastMessageDirection: 'outgoing' as const,
-          lastMessageType: 'text' as const,
-        } : c)
-        // Drop rows that no longer match the current tab (e.g. replying from 未読 moves chat to in_progress)
-        const filtered = currentFilter === 'all' ? updated : updated.filter((c) => c.status === currentFilter)
-        return [...filtered].sort((a, b) => {
-          const at = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
-          const bt = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
-          return bt - at
+      // --- Image send path (runs first when image is present) ---
+      if (pendingImage && pendingImage.mode === 'line-image') {
+        const imgPayload = JSON.stringify({
+          originalContentUrl: pendingImage.originalContentUrl,
+          previewImageUrl: pendingImage.previewImageUrl,
         })
-      })
+        await api.chats.send(sendingChatId, { messageType: 'image', content: imgPayload })
+        setPendingImage(null)
+        // Optimistic update for image
+        setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
+          ...prev,
+          lastMessageAt: now,
+          status: 'in_progress',
+          messages: [
+            ...(prev.messages ?? []),
+            {
+              id: crypto.randomUUID(),
+              direction: 'outgoing',
+              messageType: 'image',
+              content: imgPayload,
+              createdAt: now,
+            },
+          ],
+        } : prev)
+        setChats((prev) => {
+          const exists = prev.some((c) => c.id === sendingChatId)
+          if (!exists) return prev
+          const currentFilter = statusFilterRef.current
+          const currentUnansweredOnly = unansweredOnlyRef.current
+          const updated = prev.map((c) => c.id === sendingChatId ? {
+            ...c,
+            lastMessageAt: now,
+            status: 'in_progress' as const,
+            lastMessageContent: '[画像]',
+            lastMessageDirection: 'outgoing' as const,
+            lastMessageType: 'image' as const,
+          } : c)
+          let filtered = currentFilter === 'all' ? updated : updated.filter((c) => c.status === currentFilter)
+          if (currentUnansweredOnly) {
+            // 未対応モードでは、自分が返信したばかりの chat はもう未対応ではないのでリストから除外
+            filtered = filtered.filter((c) => c.id !== sendingChatId)
+          }
+          return [...filtered].sort((a, b) => {
+            const at = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+            const bt = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+            return bt - at
+          })
+        })
+      }
+      // --- Text send path (runs independently — both paths execute when both image and text are present) ---
+      if (messageContent.trim()) {
+        const content = messageContent.trim()
+        await api.chats.send(sendingChatId, { content })
+        setMessageContent('')
+        // Optimistic update: append message locally instead of refetching (prevents scroll jump / full reload feel)
+        // Only mutate chatDetail if it still corresponds to the chat we just sent to
+        setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
+          ...prev,
+          lastMessageAt: now,
+          status: 'in_progress',
+          messages: [
+            ...(prev.messages ?? []),
+            {
+              id: crypto.randomUUID(),
+              direction: 'outgoing',
+              messageType: 'text',
+              content,
+              createdAt: now,
+            },
+          ],
+        } : prev)
+        setChats((prev) => {
+          // Skip reconciliation if the list no longer contains this chat (e.g. tab changed mid-send)
+          const exists = prev.some((c) => c.id === sendingChatId)
+          if (!exists) return prev
+          const currentFilter = statusFilterRef.current
+          const currentUnansweredOnly = unansweredOnlyRef.current
+          const updated = prev.map((c) => c.id === sendingChatId ? {
+            ...c,
+            lastMessageAt: now,
+            status: 'in_progress' as const,
+            // 一覧の preview も即時更新する。incoming 優先ロジックで上書きされ得るが、
+            // 楽観 UI では「operator が今送った文面」が一瞬見えるのが期待動作。
+            // 次回 loadChats() で server 側の真の最新 (incoming 優先) に reconcile される。
+            lastMessageContent: content,
+            lastMessageDirection: 'outgoing' as const,
+            lastMessageType: 'text' as const,
+          } : c)
+          // Drop rows that no longer match the current tab (e.g. replying from 未読 moves chat to in_progress)
+          let filtered = currentFilter === 'all' ? updated : updated.filter((c) => c.status === currentFilter)
+          if (currentUnansweredOnly) {
+            // 未対応モードでは、自分が返信したばかりの chat はもう未対応ではないのでリストから除外
+            filtered = filtered.filter((c) => c.id !== sendingChatId)
+          }
+          return [...filtered].sort((a, b) => {
+            const at = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+            const bt = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+            return bt - at
+          })
+        })
+      }
     } catch {
       setError('メッセージの送信に失敗しました。')
     } finally {
@@ -605,6 +715,33 @@ export default function ChatsPage() {
         {/* Left Panel: Chat List */}
         <div className={`w-full lg:w-96 lg:flex-shrink-0 bg-white rounded-lg shadow-sm border border-gray-200 flex-col overflow-hidden ${selectedChatId ? 'hidden lg:flex' : 'flex'}`}>
           {/* タブ (全て / 未読 / 対応中 / 解決済) は意図的に削除。直近メッセージが見やすい LINE 風一覧を優先。 */}
+
+          {/* Filter row */}
+          <div className="px-3 py-2 border-b border-gray-100 flex flex-wrap items-center gap-2">
+            {statusFilters.map((f) => (
+              <button
+                key={f.key}
+                onClick={() => setStatusFilter(f.key)}
+                disabled={unansweredOnly}
+                className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                  statusFilter === f.key
+                    ? 'bg-green-500 text-white'
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                } ${unansweredOnly ? 'opacity-40 cursor-not-allowed' : ''}`}
+              >
+                {f.label}
+              </button>
+            ))}
+            <label className="flex items-center gap-1.5 text-xs font-medium whitespace-nowrap ml-auto cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={unansweredOnly}
+                onChange={(e) => setUnansweredOnly(e.target.checked)}
+                className="rounded"
+              />
+              🔥 未対応のみ
+            </label>
+          </div>
 
           {/* Chat List */}
           <div className="flex-1 overflow-y-auto">
@@ -740,6 +877,23 @@ export default function ChatsPage() {
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  {unansweredOnly && chats.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const idx = chats.findIndex((c) => c.id === selectedChatId)
+                        if (idx < 0) return
+                        const next = chats[(idx + 1) % chats.length]
+                        if (next && next.id !== selectedChatId) {
+                          setSelectedChatId(next.id)
+                        }
+                      }}
+                      className="rounded-md bg-emerald-600 px-3 py-1.5 min-h-[44px] lg:min-h-0 text-sm font-medium text-white hover:bg-emerald-700"
+                      title="次の未対応 friend に進む"
+                    >
+                      次の未対応 →
+                    </button>
+                  )}
                   {chatDetail.status !== 'unread' && (
                     <button
                       onClick={() => handleStatusUpdate('unread')}
@@ -796,6 +950,8 @@ export default function ChatsPage() {
                       } catch {
                         bubbleContent = <span>🖼️ [画像]</span>
                       }
+                    } else if (msg.messageType === 'sticker') {
+                      bubbleContent = <StickerMessageImage content={msg.content} />
                     } else {
                       bubbleContent = <span>{msg.content}</span>
                     }
@@ -907,10 +1063,20 @@ export default function ChatsPage() {
                     <span>Shift+Enter</span>
                   </label>
                 </div>
+                <div className="mb-2">
+                  <ImageUploader
+                    mode="line-image"
+                    value={pendingImage}
+                    onChange={setPendingImage}
+                    label="画像を送る (任意)"
+                  />
+                </div>
                 <div className="flex items-end gap-2">
                   <textarea
+                    ref={textareaRef}
                     rows={2}
                     value={messageContent}
+                    style={{ maxHeight: '200px', overflowY: 'auto' }}
                     onChange={(e) => {
                       const value = e.target.value
                       setMessageContent(value)
@@ -929,11 +1095,11 @@ export default function ChatsPage() {
                     onBlur={() => setIsMessageInputFocused(false)}
                     onKeyDown={handleKeyDown}
                     placeholder="メッセージを入力..."
-                    className="flex-1 text-sm border border-gray-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-green-500 resize-none"
+                    className="flex-1 text-sm border border-gray-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-green-500 resize-none overflow-y-auto"
                   />
                   <button
                     onClick={handleSendMessage}
-                    disabled={sending || !messageContent.trim()}
+                    disabled={sending || (!messageContent.trim() && !pendingImage)}
                     className="px-4 py-2 text-sm font-medium text-white rounded-lg transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ backgroundColor: '#06C755' }}
                   >

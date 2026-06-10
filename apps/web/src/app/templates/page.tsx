@@ -5,6 +5,7 @@ import { api } from '@/lib/api'
 import Header from '@/components/layout/header'
 import FlexPreviewComponent from '@/components/flex-preview'
 import CcPromptButton from '@/components/cc-prompt-button'
+import ImageUploader from '@/components/shared/image-uploader'
 
 interface Template {
   id: string
@@ -296,13 +297,43 @@ export default function TemplatesPage() {
             </div>
             <div>
               <label className="block text-xs font-medium text-gray-600 mb-1">内容 / JSON <span className="text-red-500">*</span></label>
-              <textarea
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-green-500 resize-y"
-                rows={form.messageType === 'flex' ? 10 : 4}
-                placeholder={form.messageType === 'flex' ? '{"type":"bubble","body":...}' : 'メッセージ内容'}
-                value={form.messageContent}
-                onChange={(e) => setForm({ ...form, messageContent: e.target.value })}
-              />
+              {form.messageType === 'image' ? (
+                <ImageUploader
+                  mode="line-image"
+                  value={(() => {
+                    try {
+                      const parsed = JSON.parse(form.messageContent) as { originalContentUrl?: string; previewImageUrl?: string }
+                      if (parsed.originalContentUrl) {
+                        return {
+                          mode: 'line-image' as const,
+                          originalContentUrl: parsed.originalContentUrl,
+                          previewImageUrl: parsed.previewImageUrl ?? parsed.originalContentUrl,
+                        }
+                      }
+                    } catch { /* ignore */ }
+                    return null
+                  })()}
+                  onChange={(v) => {
+                    if (v?.mode === 'line-image') {
+                      setForm((prev) => ({ ...prev, messageContent: JSON.stringify({
+                        originalContentUrl: v.originalContentUrl,
+                        previewImageUrl: v.previewImageUrl,
+                      }) }))
+                    } else {
+                      setForm((prev) => ({ ...prev, messageContent: '' }))
+                    }
+                  }}
+                  label="テンプレート画像"
+                />
+              ) : (
+                <textarea
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-green-500 resize-y"
+                  rows={form.messageType === 'flex' ? 10 : 4}
+                  placeholder={form.messageType === 'flex' ? '{"type":"bubble","body":...}' : 'メッセージ内容'}
+                  value={form.messageContent}
+                  onChange={(e) => setForm({ ...form, messageContent: e.target.value })}
+                />
+              )}
             </div>
 
             {formError && <p className="text-xs text-red-600">{formError}</p>}

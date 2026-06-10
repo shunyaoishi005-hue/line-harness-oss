@@ -274,48 +274,72 @@ async function processSingleDelivery(
   return true;
 }
 
-async function evaluateCondition(
+export const SUPPORTED_CONDITION_TYPES = [
+  'tag_exists',
+  'tag_not_exists',
+  'metadata_equals',
+  'metadata_not_equals',
+] as const;
+
+export function isSupportedConditionType(value: unknown): value is (typeof SUPPORTED_CONDITION_TYPES)[number] {
+  return typeof value === 'string' && (SUPPORTED_CONDITION_TYPES as readonly string[]).includes(value);
+}
+
+export async function evaluateCondition(
   db: D1Database,
   friendId: string,
   step: { condition_type: string | null; condition_value: string | null },
 ): Promise<boolean> {
-  if (!step.condition_type || !step.condition_value) return true;
+  if (!step.condition_type) return true;
+  if (!isSupportedConditionType(step.condition_type)) {
+    console.error(`[scenario] unsupported condition_type: ${step.condition_type}`);
+    return false;
+  }
+  if (!step.condition_value) {
+    console.error(`[scenario] missing condition_value for condition_type: ${step.condition_type}`);
+    return false;
+  }
 
-  switch (step.condition_type) {
-    case 'tag_exists': {
-      const tag = await db
-        .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ?')
-        .bind(friendId, step.condition_value)
-        .first();
-      return !!tag;
+  try {
+    switch (step.condition_type) {
+      case 'tag_exists': {
+        const tag = await db
+          .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ?')
+          .bind(friendId, step.condition_value)
+          .first();
+        return !!tag;
+      }
+      case 'tag_not_exists': {
+        const tag = await db
+          .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ?')
+          .bind(friendId, step.condition_value)
+          .first();
+        return !tag;
+      }
+      case 'metadata_equals':
+      case 'metadata_not_equals': {
+        const parsed = JSON.parse(step.condition_value) as { key?: unknown; value?: unknown };
+        if (typeof parsed.key !== 'string' || !Object.prototype.hasOwnProperty.call(parsed, 'value')) {
+          console.error('[scenario] malformed metadata condition_value');
+          return false;
+        }
+        const friend = await db
+          .prepare('SELECT metadata FROM friends WHERE id = ?')
+          .bind(friendId)
+          .first<{ metadata: string }>();
+        let metadata: Record<string, unknown> = {};
+        try {
+          metadata = JSON.parse(friend?.metadata || '{}') as Record<string, unknown>;
+        } catch {
+          metadata = {};
+        }
+        const matches = metadata[parsed.key] === parsed.value;
+        return step.condition_type === 'metadata_equals' ? matches : !matches;
+      }
     }
-    case 'tag_not_exists': {
-      const tag = await db
-        .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ?')
-        .bind(friendId, step.condition_value)
-        .first();
-      return !tag;
-    }
-    case 'metadata_equals': {
-      const { key, value } = JSON.parse(step.condition_value) as { key: string; value: unknown };
-      const friend = await db
-        .prepare('SELECT metadata FROM friends WHERE id = ?')
-        .bind(friendId)
-        .first<{ metadata: string }>();
-      const metadata = JSON.parse(friend?.metadata || '{}') as Record<string, unknown>;
-      return metadata[key] === value;
-    }
-    case 'metadata_not_equals': {
-      const { key, value } = JSON.parse(step.condition_value) as { key: string; value: unknown };
-      const friend = await db
-        .prepare('SELECT metadata FROM friends WHERE id = ?')
-        .bind(friendId)
-        .first<{ metadata: string }>();
-      const metadata = JSON.parse(friend?.metadata || '{}') as Record<string, unknown>;
-      return metadata[key] !== value;
-    }
-    default:
-      return true;
+  } catch (err) {
+    console.error('[scenario] condition evaluation failed', err);
+    return false;
   }
 }
 

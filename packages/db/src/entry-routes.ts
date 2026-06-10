@@ -271,6 +271,68 @@ export async function recordRefTracking(
     .first<RefTracking>())!;
 }
 
+export async function attachRefTrackingToFriend(
+  db: D1Database,
+  opts: {
+    trackingId: string;
+    refCode: string;
+    friendId: string;
+    entryRouteId?: string | null;
+    sourceUrl?: string | null;
+    fbclid?: string | null;
+    gclid?: string | null;
+    twclid?: string | null;
+    ttclid?: string | null;
+    utmSource?: string | null;
+    utmMedium?: string | null;
+    utmCampaign?: string | null;
+    userAgent?: string | null;
+    ipAddress?: string | null;
+  },
+): Promise<RefTracking | null> {
+  const result = await db
+    .prepare(
+      `UPDATE ref_tracking
+       SET friend_id = ?,
+           entry_route_id = COALESCE(entry_route_id, ?),
+           source_url = COALESCE(source_url, ?),
+           fbclid = COALESCE(fbclid, ?),
+           gclid = COALESCE(gclid, ?),
+           twclid = COALESCE(twclid, ?),
+           ttclid = COALESCE(ttclid, ?),
+           utm_source = COALESCE(utm_source, ?),
+           utm_medium = COALESCE(utm_medium, ?),
+           utm_campaign = COALESCE(utm_campaign, ?),
+           user_agent = COALESCE(user_agent, ?),
+           ip_address = COALESCE(ip_address, ?)
+       WHERE id = ? AND ref_code = ? AND friend_id IS NULL`,
+    )
+    .bind(
+      opts.friendId,
+      opts.entryRouteId ?? null,
+      opts.sourceUrl ?? null,
+      opts.fbclid ?? null,
+      opts.gclid ?? null,
+      opts.twclid ?? null,
+      opts.ttclid ?? null,
+      opts.utmSource ?? null,
+      opts.utmMedium ?? null,
+      opts.utmCampaign ?? null,
+      opts.userAgent ?? null,
+      opts.ipAddress ?? null,
+      opts.trackingId,
+      opts.refCode,
+    )
+    .run();
+
+  if (!result.meta?.changes) return null;
+
+  return db
+    .prepare(`SELECT * FROM ref_tracking WHERE id = ?`)
+    .bind(opts.trackingId)
+    .first<RefTracking>();
+}
+
 export async function getRefTrackingWithClickIds(
   db: D1Database,
   friendId: string,

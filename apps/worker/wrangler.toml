@@ -1,6 +1,12 @@
 name = "line-harness"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+# nodejs_compat is required by @line-harness/update-engine which pulls in
+# `node:stream` (Readable.fromWeb), `node:zlib` (createGunzip), `node:crypto`
+# (createHash), and the `tar-stream` package for bundle parsing during the
+# /admin/update/* self-update flow. Without this flag the route imports
+# fail at runtime. compatibility_date 2024-09-23+ is required for the flag.
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 # ═══════════════════════════════════════════════════════════════
@@ -26,7 +32,23 @@ bucket_name = "line-harness-images"
 crons = ["*/5 * * * *", "0 */6 * * *"]
 
 # ═══════════════════════════════════════════════════════════════
-# 本番環境 (aiagent.mini@)
+# Phase 5 self-update vars — consumed by /admin/update/*. Secrets
+# (CF_API_TOKEN, ADMIN_API_KEY) must be set via `wrangler secret put`
+# and are intentionally absent from this file.
+# ═══════════════════════════════════════════════════════════════
+[vars]
+WORKER_NAME = "line-harness"
+ADMIN_PAGES_PROJECT = "line-harness-admin"
+LIFF_PAGES_PROJECT = "line-harness-liff"
+D1_DATABASE_ID = "YOUR_DEV_D1_DATABASE_ID"
+MANIFEST_URL = "https://github.com/Shudesu/line-harness-oss/releases/latest/download/release-manifest.json"
+WORKER_PUBLIC_URL = "https://line-harness.workers.dev"
+ADMIN_PUBLIC_URL = "https://line-harness-admin.pages.dev"
+LIFF_PUBLIC_URL = "https://line-harness-liff.pages.dev"
+CF_ACCOUNT_ID = "YOUR_DEV_ACCOUNT_ID"
+
+# ═══════════════════════════════════════════════════════════════
+# 本番環境
 # 使い方: npx wrangler deploy --env production --name your-worker-name
 # D1:     npx wrangler d1 execute line-crm --env production --remote --file ...
 # ═══════════════════════════════════════════════════════════════
@@ -48,3 +70,17 @@ bucket_name = "line-harness-images"
 
 [env.production.triggers]
 crons = ["*/5 * * * *", "0 */6 * * *"]
+
+# Phase 5 self-update vars for production. Worker / Pages / D1 names point at
+# the prod resources. Secrets (CF_API_TOKEN, ADMIN_API_KEY) live in the
+# production secret store, set via `wrangler secret put --env production`.
+[env.production.vars]
+WORKER_NAME = "your-worker-name"
+ADMIN_PAGES_PROJECT = "line-harness-admin"
+LIFF_PAGES_PROJECT = "line-harness-liff"
+D1_DATABASE_ID = "YOUR_D1_DATABASE_ID"
+MANIFEST_URL = "https://github.com/Shudesu/line-harness-oss/releases/latest/download/release-manifest.json"
+WORKER_PUBLIC_URL = "https://your-worker-name.workers.dev"
+ADMIN_PUBLIC_URL = "https://line-harness-admin.pages.dev"
+LIFF_PUBLIC_URL = "https://line-harness-liff.pages.dev"
+CF_ACCOUNT_ID = "YOUR_ACCOUNT_ID"

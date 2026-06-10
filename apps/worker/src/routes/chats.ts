@@ -185,6 +185,18 @@ chats.get('/api/chats', async (c) => {
     const status = c.req.query('status') ?? undefined;
     const operatorId = c.req.query('operatorId') ?? undefined;
     const lineAccountId = c.req.query('lineAccountId') ?? undefined;
+    const unansweredOnly =
+      c.req.query('unansweredOnly') === 'true' || c.req.query('unansweredOnly') === '1';
+
+    let unansweredIds: Set<string> | null = null;
+    if (unansweredOnly) {
+      const { getUnansweredFriendIds } = await import('../services/unanswered-inbox.js');
+      unansweredIds = await getUnansweredFriendIds(c.env.DB);
+      // 空 Set のとき = 未対応ゼロ。早期 return で空配列を返す。
+      if (unansweredIds.size === 0) {
+        return c.json({ success: true, data: [] });
+      }
+    }
 
     // List everyone who has any message history (incoming or outgoing — push/broadcast/scenario included)
     // PLUS any chats row that exists even before any messages_log entry is written.
@@ -321,24 +333,27 @@ chats.get('/api/chats', async (c) => {
       : c.env.DB.prepare(sql);
     const result = await stmt.all();
 
-    return c.json({
-      success: true,
-      data: result.results.map((ch: Record<string, unknown>) => ({
-        id: ch.id,
-        friendId: ch.friend_id,
-        friendName: ch.display_name || '名前なし',
-        friendPictureUrl: ch.picture_url || null,
-        operatorId: ch.operator_id,
-        status: ch.status,
-        notes: ch.notes,
-        lastMessageAt: ch.last_message_at,
-        lastMessageContent: ch.last_message_content || null,
-        lastMessageDirection: ch.last_message_direction || null,
-        lastMessageType: ch.last_message_type || null,
-        createdAt: ch.created_at,
-        updatedAt: ch.updated_at,
-      })),
-    });
+    let data = result.results.map((ch: Record<string, unknown>) => ({
+      id: ch.id as string,
+      friendId: ch.friend_id,
+      friendName: ch.display_name || '名前なし',
+      friendPictureUrl: ch.picture_url || null,
+      operatorId: ch.operator_id,
+      status: ch.status,
+      notes: ch.notes,
+      lastMessageAt: ch.last_message_at,
+      lastMessageContent: ch.last_message_content || null,
+      lastMessageDirection: ch.last_message_direction || null,
+      lastMessageType: ch.last_message_type || null,
+      createdAt: ch.created_at,
+      updatedAt: ch.updated_at,
+    }));
+
+    if (unansweredIds) {
+      data = data.filter((row) => unansweredIds!.has(row.id));
+    }
+
+    return c.json({ success: true, data });
   } catch (err) {
     console.error('GET /api/chats error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
@@ -525,6 +540,16 @@ chats.post('/api/chats/:id/send', async (c) => {
     } else if (messageType === 'flex') {
       const contents = JSON.parse(body.content);
       await lineClient.pushFlexMessage(friend.line_user_id, extractFlexAltText(contents), contents);
+    } else if (messageType === 'image') {
+      const parsed = JSON.parse(body.content) as {
+        originalContentUrl: string;
+        previewImageUrl: string;
+      };
+      await lineClient.pushImageMessage(
+        friend.line_user_id,
+        parsed.originalContentUrl,
+        parsed.previewImageUrl,
+      );
     }
 
     // メッセージログに記録

@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { eventsApi, type EventDetail, type EventSlot } from '@/lib/api'
+import ImageUploader from '@/components/shared/image-uploader'
 import { useAccount } from '@/contexts/account-context'
 import { generateBulkSlots, type BulkSlotInput } from './bulk-slot-generator'
 
@@ -487,17 +488,12 @@ function OverviewTab({
         </div>
       </div>
       <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1.5">イベント画像 URL</label>
-        <input
-          type="url"
-          value={draft.image_url ?? ''}
-          onChange={(e) => update('image_url', e.target.value || null)}
-          placeholder="https://... (R2 / 外部 CDN)"
-          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        <ImageUploader
+          mode="url"
+          value={draft.image_url ? { mode: 'url', url: draft.image_url } : null}
+          onChange={(v) => update('image_url', v?.mode === 'url' ? v.url : null)}
+          label="イベント画像"
         />
-        {draft.image_url && (
-          <img src={draft.image_url} alt="" className="mt-2 max-h-40 rounded-lg border border-gray-200" />
-        )}
       </div>
       <div>
         <label className="flex justify-between items-center text-sm font-medium text-gray-700 mb-1.5">

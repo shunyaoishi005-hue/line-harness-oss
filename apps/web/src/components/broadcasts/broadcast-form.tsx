@@ -5,6 +5,7 @@ import type { Tag } from '@line-crm/shared'
 import { api, eventsApi, type ApiBroadcast, type EventListItem } from '@/lib/api'
 import { useAccount } from '@/contexts/account-context'
 import FlexPreviewComponent from '@/components/flex-preview'
+import ImageUploader from '@/components/shared/image-uploader'
 import MultiAccountDedupSection from './multi-account-dedup-section'
 
 interface BroadcastFormProps {
@@ -159,42 +160,31 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
             )}
           </label>
 
-          {/* Image helper: URL inputs that auto-generate the required LINE image JSON */}
-          {form.messageType === 'image' && (() => {
-            let parsed: { originalContentUrl?: string; previewImageUrl?: string } = {}
-            try { parsed = JSON.parse(form.messageContent) } catch { /* not yet valid */ }
-            return (
-              <div className="space-y-2 mb-2">
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">元画像URL (originalContentUrl)</label>
-                  <input
-                    type="url"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
-                    placeholder="https://example.com/image.png"
-                    value={parsed.originalContentUrl ?? ''}
-                    onChange={(e) => {
-                      const orig = e.target.value
-                      const prev = parsed.previewImageUrl ?? orig
-                      setForm({ ...form, messageContent: JSON.stringify({ originalContentUrl: orig, previewImageUrl: prev }) })
-                    }}
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">プレビュー画像URL (previewImageUrl)</label>
-                  <input
-                    type="url"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
-                    placeholder="https://example.com/preview.png (空欄で元画像と同じ)"
-                    value={parsed.previewImageUrl ?? ''}
-                    onChange={(e) => {
-                      const prev = e.target.value
-                      setForm({ ...form, messageContent: JSON.stringify({ originalContentUrl: parsed.originalContentUrl ?? '', previewImageUrl: prev }) })
-                    }}
-                  />
-                </div>
-              </div>
-            )
-          })()}
+          {/* Image helper: ImageUploader that auto-generates the required LINE image JSON */}
+          {form.messageType === 'image' && (
+            <div className="mb-2">
+              <ImageUploader
+                mode="line-image"
+                value={(() => {
+                  try {
+                    const parsed = JSON.parse(form.messageContent) as { originalContentUrl?: string; previewImageUrl?: string }
+                    if (parsed.originalContentUrl) {
+                      return { mode: 'line-image' as const, originalContentUrl: parsed.originalContentUrl, previewImageUrl: parsed.previewImageUrl ?? parsed.originalContentUrl }
+                    }
+                  } catch { /* ignore */ }
+                  return null
+                })()}
+                onChange={(v) => {
+                  if (v?.mode === 'line-image') {
+                    setForm((prev) => ({ ...prev, messageContent: JSON.stringify({ originalContentUrl: v.originalContentUrl, previewImageUrl: v.previewImageUrl }) }))
+                  } else {
+                    setForm((prev) => ({ ...prev, messageContent: '' }))
+                  }
+                }}
+                label="送信する画像"
+              />
+            </div>
+          )}
 
           {/* リンクするイベント: 選択で {{liff_id}} 入りテンプレ URL を本文末尾に挿入 */}
           {linkableEvents.length > 0 && form.messageType === 'text' && (

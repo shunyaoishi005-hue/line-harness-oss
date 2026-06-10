@@ -7,6 +7,7 @@ import {
   upsertFriend,
   getEntryRouteByRefCode,
   recordRefTracking,
+  attachRefTrackingToFriend,
   addTagToFriend,
   getLineAccountByChannelId,
   getLineAccountById,
@@ -313,6 +314,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const utmSource = c.req.query('utm_source') || '';
   const utmMedium = c.req.query('utm_medium') || '';
   const utmCampaign = c.req.query('utm_campaign') || '';
+  const refTrackingId = c.req.query('rt') || '';
   let accountParam = c.req.query('account') || '';
   const uidParam = c.req.query('uid') || ''; // existing user UUID for cross-account linking
   const igParam = c.req.query('ig') || ''; // IG Harness IGSID for cross-platform linking
@@ -329,7 +331,7 @@ liffRoutes.get('/auth/line', async (c) => {
   //   4. 'main' traffic pool fallback
   //   5. env default
   let channelId = c.env.LINE_LOGIN_CHANNEL_ID;
-  let liffUrl = c.env.LIFF_URL;
+  let liffUrl = c.env.LIFF_URL || '';
 
   // 1. entry_route → pool_id. getTrafficPoolById skips the is_active check
   // that getTrafficPoolBySlug does for us, so we filter disabled pools here
@@ -391,6 +393,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const liffParams = new URLSearchParams();
   if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
   if (externalRef) liffParams.set('ref', externalRef);
+  if (refTrackingId) liffParams.set('rt', refTrackingId);
   if (formId) liffParams.set('form', formId);
   const gateParam = c.req.query('gate') || '';
   if (gateParam) liffParams.set('gate', gateParam);
@@ -415,7 +418,7 @@ liffRoutes.get('/auth/line', async (c) => {
   // can verify against the correct gate via the correct X Harness instance.
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
-  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam });
+  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam, rt: refTrackingId });
   const encodedState = btoa(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
@@ -433,6 +436,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const qrParams = new URLSearchParams();
   if (liffIdMatch) qrParams.set('liffId', liffIdMatch[1]);
   if (externalRef) qrParams.set('ref', externalRef);
+  if (refTrackingId) qrParams.set('rt', refTrackingId);
   if (formId) qrParams.set('form', formId);
   if (gateParam) qrParams.set('gate', gateParam);
   if (xhParam2) qrParams.set('xh', xhParam2);
@@ -608,6 +612,7 @@ liffRoutes.get('/auth/callback', async (c) => {
   let accountParam = '';
   let uidParam = '';
   let igParam = '';
+  let refTrackingId = '';
   try {
     const parsed = JSON.parse(atob(stateParam));
     ref = parsed.ref || '';
@@ -625,6 +630,7 @@ liffRoutes.get('/auth/callback', async (c) => {
     accountParam = parsed.account || '';
     uidParam = parsed.uid || '';
     igParam = parsed.ig || '';
+    refTrackingId = parsed.rt || '';
   } catch {
     // ignore
   }
@@ -771,22 +777,43 @@ liffRoutes.get('/auth/callback', async (c) => {
       // Look up entry route config
       const route = await getEntryRouteByRefCode(db, ref);
 
-      // Persist tracking event with ad click IDs
-      await recordRefTracking(db, {
-        refCode: ref,
-        friendId: friend.id,
-        entryRouteId: route?.id ?? null,
-        sourceUrl: null,
-        fbclid: fbclid || null,
-        gclid: gclid || null,
-        twclid: twclid || null,
-        ttclid: ttclid || null,
-        utmSource: utmSource || null,
-        utmMedium: utmMedium || null,
-        utmCampaign: utmCampaign || null,
-        userAgent: c.req.header('User-Agent') || null,
-        ipAddress: c.req.header('CF-Connecting-IP') || null,
-      });
+      // Persist tracking event with ad click IDs. If /r already recorded an
+      // anonymous LP click, attach this friend to that row instead of double counting.
+      const attached = refTrackingId
+        ? await attachRefTrackingToFriend(db, {
+            trackingId: refTrackingId,
+            refCode: ref,
+            friendId: friend.id,
+            entryRouteId: route?.id ?? null,
+            sourceUrl: null,
+            fbclid: fbclid || null,
+            gclid: gclid || null,
+            twclid: twclid || null,
+            ttclid: ttclid || null,
+            utmSource: utmSource || null,
+            utmMedium: utmMedium || null,
+            utmCampaign: utmCampaign || null,
+            userAgent: c.req.header('User-Agent') || null,
+            ipAddress: c.req.header('CF-Connecting-IP') || null,
+          })
+        : null;
+      if (!attached) {
+        await recordRefTracking(db, {
+          refCode: ref,
+          friendId: friend.id,
+          entryRouteId: route?.id ?? null,
+          sourceUrl: null,
+          fbclid: fbclid || null,
+          gclid: gclid || null,
+          twclid: twclid || null,
+          ttclid: ttclid || null,
+          utmSource: utmSource || null,
+          utmMedium: utmMedium || null,
+          utmCampaign: utmCampaign || null,
+          userAgent: c.req.header('User-Agent') || null,
+          ipAddress: c.req.header('CF-Connecting-IP') || null,
+        });
+      }
 
       await applyRefAttribution(c, ref, friend, lineUserId, {
         accountChannelId: accountParam || null,
@@ -1137,6 +1164,15 @@ liffRoutes.post('/api/liff/link', async (c) => {
       ref?: string;
       existingUuid?: string;
       ig?: string;
+      sourceUrl?: string;
+      fbclid?: string;
+      gclid?: string;
+      twclid?: string;
+      ttclid?: string;
+      utmSource?: string;
+      utmMedium?: string;
+      utmCampaign?: string;
+      refTrackingId?: string;
     }>();
 
     if (!body.idToken) {
@@ -1195,12 +1231,41 @@ liffRoutes.post('/api/liff/link', async (c) => {
       if (body.ref && !body.ref.startsWith('xh:')) {
         try {
           const route = await getEntryRouteByRefCode(db, body.ref);
-          await recordRefTracking(db, {
-            refCode: body.ref,
-            friendId: friend.id,
-            entryRouteId: route?.id ?? null,
-            sourceUrl: null,
-          });
+          const attached = body.refTrackingId
+            ? await attachRefTrackingToFriend(db, {
+                trackingId: body.refTrackingId,
+                refCode: body.ref,
+                friendId: friend.id,
+                entryRouteId: route?.id ?? null,
+                sourceUrl: body.sourceUrl || null,
+                fbclid: body.fbclid || null,
+                gclid: body.gclid || null,
+                twclid: body.twclid || null,
+                ttclid: body.ttclid || null,
+                utmSource: body.utmSource || null,
+                utmMedium: body.utmMedium || null,
+                utmCampaign: body.utmCampaign || null,
+                userAgent: c.req.header('User-Agent') || null,
+                ipAddress: c.req.header('CF-Connecting-IP') || null,
+              })
+            : null;
+          if (!attached) {
+            await recordRefTracking(db, {
+              refCode: body.ref,
+              friendId: friend.id,
+              entryRouteId: route?.id ?? null,
+              sourceUrl: body.sourceUrl || null,
+              fbclid: body.fbclid || null,
+              gclid: body.gclid || null,
+              twclid: body.twclid || null,
+              ttclid: body.ttclid || null,
+              utmSource: body.utmSource || null,
+              utmMedium: body.utmMedium || null,
+              utmCampaign: body.utmCampaign || null,
+              userAgent: c.req.header('User-Agent') || null,
+              ipAddress: c.req.header('CF-Connecting-IP') || null,
+            });
+          }
         } catch { /* silent */ }
       }
       if (body.ref) {
@@ -1262,12 +1327,41 @@ liffRoutes.post('/api/liff/link', async (c) => {
       // Record ref tracking
       try {
         const route = await getEntryRouteByRefCode(db, body.ref);
-        await recordRefTracking(db, {
-          refCode: body.ref,
-          friendId: friend.id,
-          entryRouteId: route?.id ?? null,
-          sourceUrl: null,
-        });
+        const attached = body.refTrackingId
+          ? await attachRefTrackingToFriend(db, {
+              trackingId: body.refTrackingId,
+              refCode: body.ref,
+              friendId: friend.id,
+              entryRouteId: route?.id ?? null,
+              sourceUrl: body.sourceUrl || null,
+              fbclid: body.fbclid || null,
+              gclid: body.gclid || null,
+              twclid: body.twclid || null,
+              ttclid: body.ttclid || null,
+              utmSource: body.utmSource || null,
+              utmMedium: body.utmMedium || null,
+              utmCampaign: body.utmCampaign || null,
+              userAgent: c.req.header('User-Agent') || null,
+              ipAddress: c.req.header('CF-Connecting-IP') || null,
+            })
+          : null;
+        if (!attached) {
+          await recordRefTracking(db, {
+            refCode: body.ref,
+            friendId: friend.id,
+            entryRouteId: route?.id ?? null,
+            sourceUrl: body.sourceUrl || null,
+            fbclid: body.fbclid || null,
+            gclid: body.gclid || null,
+            twclid: body.twclid || null,
+            ttclid: body.ttclid || null,
+            utmSource: body.utmSource || null,
+            utmMedium: body.utmMedium || null,
+            utmCampaign: body.utmCampaign || null,
+            userAgent: c.req.header('User-Agent') || null,
+            ipAddress: c.req.header('CF-Connecting-IP') || null,
+          });
+        }
       } catch { /* silent */ }
 
       // Apply ref attribution (tag + scenario push) for newly-linked friends
@@ -1319,8 +1413,9 @@ liffRoutes.get('/api/analytics/ref-summary', async (c) => {
   try {
     const db = c.env.DB;
     const lineAccountId = c.req.query('lineAccountId');
-    const accountFilter = lineAccountId ? 'AND f.line_account_id = ?' : '';
-    const accountBinds = lineAccountId ? [lineAccountId] : [];
+    const accountBinds = lineAccountId
+      ? [lineAccountId, lineAccountId, lineAccountId, lineAccountId, lineAccountId]
+      : [];
 
     // friends 起点で集計することで、entry_routes に登録されていない ref
     // (例えば X Harness が発行する UUID ref) も summary に拾えるようにする。
@@ -1328,19 +1423,50 @@ liffRoutes.get('/api/analytics/ref-summary', async (c) => {
     // ト側で「(未登録)」と表示)。
     const rows = await db
       .prepare(
-        `SELECT
-          f.ref_code,
+        `WITH refs AS (
+          SELECT DISTINCT f.ref_code
+          FROM friends f
+          WHERE f.ref_code IS NOT NULL AND f.ref_code != ''
+            ${lineAccountId ? 'AND f.line_account_id = ?' : ''}
+          UNION
+          SELECT DISTINCT rt.ref_code
+          FROM ref_tracking rt
+          WHERE rt.ref_code IS NOT NULL AND rt.ref_code != ''
+        )
+        SELECT
+          refs.ref_code,
           er.name as name,
-          COUNT(DISTINCT f.id) as friend_count,
-          COUNT(DISTINCT rt.id) as click_count,
-          MAX(f.created_at) as latest_at
-        FROM friends f
-        LEFT JOIN entry_routes er ON er.ref_code = f.ref_code
-        LEFT JOIN ref_tracking rt ON rt.ref_code = f.ref_code AND rt.friend_id = f.id
-        WHERE f.ref_code IS NOT NULL AND f.ref_code != ''
-          ${accountFilter ? `${accountFilter}` : ''}
-        GROUP BY f.ref_code, er.name
-        ORDER BY friend_count DESC`,
+          (
+            SELECT COUNT(DISTINCT f2.id)
+            FROM friends f2
+            WHERE f2.ref_code = refs.ref_code
+              ${lineAccountId ? 'AND f2.line_account_id = ?' : ''}
+          ) as friend_count,
+          (
+            SELECT COUNT(DISTINCT rt2.id)
+            FROM ref_tracking rt2
+            LEFT JOIN friends rf ON rf.id = rt2.friend_id
+            WHERE rt2.ref_code = refs.ref_code
+              ${lineAccountId ? 'AND (rt2.friend_id IS NULL OR rf.line_account_id = ?)' : ''}
+          ) as click_count,
+          (
+            SELECT MAX(latest)
+            FROM (
+              SELECT MAX(f3.created_at) as latest
+              FROM friends f3
+              WHERE f3.ref_code = refs.ref_code
+                ${lineAccountId ? 'AND f3.line_account_id = ?' : ''}
+              UNION ALL
+              SELECT MAX(rt3.created_at) as latest
+              FROM ref_tracking rt3
+              LEFT JOIN friends rf3 ON rf3.id = rt3.friend_id
+              WHERE rt3.ref_code = refs.ref_code
+                ${lineAccountId ? 'AND (rt3.friend_id IS NULL OR rf3.line_account_id = ?)' : ''}
+            )
+          ) as latest_at
+        FROM refs
+        LEFT JOIN entry_routes er ON er.ref_code = refs.ref_code
+        ORDER BY friend_count DESC, click_count DESC`,
       )
       .bind(...accountBinds)
       .all<{

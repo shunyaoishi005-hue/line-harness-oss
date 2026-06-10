@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { api } from '@/lib/api'
+import ImageUploader from '@/components/shared/image-uploader'
 
 export interface AutoReplyDraft {
   id?: string
@@ -191,18 +192,47 @@ export default function EditDialog({ draft, templates, onClose, onSaved }: Props
               )}
             </div>
           )}
-          {(mode === 'inline-text' || mode === 'inline-flex' || mode === 'inline-image') && (
+          {(mode === 'inline-text' || mode === 'inline-flex') && (
             <div>
               <label className="block text-xs text-gray-600 mb-1">
-                {mode === 'inline-flex' ? 'Flex JSON' : mode === 'inline-image' ? 'Image JSON ({"originalContentUrl":"...","previewImageUrl":"..."})' : 'テキスト'}
+                {mode === 'inline-flex' ? 'Flex JSON' : 'テキスト'}
               </label>
               <textarea
-                rows={mode === 'inline-flex' ? 8 : mode === 'inline-image' ? 5 : 4}
+                rows={mode === 'inline-flex' ? 8 : 4}
                 value={responseContent}
                 onChange={(e) => setResponseContent(e.target.value)}
                 className="w-full border border-gray-300 rounded-md px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-green-500 resize-y"
               />
             </div>
+          )}
+          {mode === 'inline-image' && (
+            <ImageUploader
+              mode="line-image"
+              value={(() => {
+                try {
+                  const parsed = JSON.parse(responseContent) as { originalContentUrl?: string; previewImageUrl?: string }
+                  if (parsed.originalContentUrl) {
+                    return {
+                      mode: 'line-image' as const,
+                      originalContentUrl: parsed.originalContentUrl,
+                      previewImageUrl: parsed.previewImageUrl ?? parsed.originalContentUrl,
+                    }
+                  }
+                } catch { /* ignore */ }
+                return null
+              })()}
+              onChange={(v) => {
+                if (v?.mode === 'line-image') {
+                  setResponseContent(JSON.stringify({
+                    originalContentUrl: v.originalContentUrl,
+                    previewImageUrl: v.previewImageUrl,
+                  }))
+                } else {
+                  setResponseContent('')
+                }
+              }}
+              label="返信画像"
+            />
           )}
           <label className="inline-flex items-center gap-2 cursor-pointer">
             <input

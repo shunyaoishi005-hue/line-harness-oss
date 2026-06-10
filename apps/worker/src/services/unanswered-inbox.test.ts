@@ -586,4 +586,38 @@ describe('auto_reply マッチ除外', () => {
     const result = await computeUnansweredInbox(db);
     expect(result.rows.map((r) => r.friendId)).toEqual(['f_new', 'f_mid', 'f_old']);
   });
+
+  test('getUnansweredFriendIds は未対応 friend の Set を返す', async () => {
+    const db = stubDB({
+      rows: [
+        baseRow({ friend_id: 'f_un1' }),
+        baseRow({ friend_id: 'f_un2' }),
+      ],
+    });
+
+    const { getUnansweredFriendIds } = await import('./unanswered-inbox.js');
+    const ids = await getUnansweredFriendIds(db);
+    expect(ids).toBeInstanceOf(Set);
+    expect(ids.has('f_un1')).toBe(true);
+    expect(ids.has('f_un2')).toBe(true);
+    expect(ids.size).toBe(2);
+  });
+
+  test('getUnansweredFriendIds は auto_reply matched を除外する', async () => {
+    const db = stubDB({
+      rows: [
+        baseRow({ friend_id: 'f_keep', last_incoming_content: '通常メッセ' }),
+        baseRow({ friend_id: 'f_drop', last_incoming_content: '導入相談' }),
+      ],
+      autoReplies: [
+        { keyword: '導入相談', match_type: 'exact', line_account_id: null },
+      ],
+    });
+
+    const { getUnansweredFriendIds } = await import('./unanswered-inbox.js');
+    const ids = await getUnansweredFriendIds(db);
+    expect(ids.has('f_keep')).toBe(true);
+    expect(ids.has('f_drop')).toBe(false);
+    expect(ids.size).toBe(1);
+  });
 });

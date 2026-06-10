@@ -8,6 +8,7 @@ import {
   getRandomPoolAccount,
   getPoolAccounts,
   getEntryRouteByRefCode,
+  recordRefTracking,
 } from '@line-crm/db';
 import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts, processQueuedBroadcasts } from './services/broadcast.js';
@@ -63,14 +64,19 @@ import { images } from './routes/images.js';
 import { accountSettings } from './routes/account-settings.js';
 import { setup } from './routes/setup.js';
 import { autoReplies } from './routes/auto-replies.js';
+import { adminAuth } from './routes/admin-auth.js';
+import { resolveCorsOrigin } from './middleware/admin-auth-config.js';
 import booking from './routes/booking.js';
 import events from './routes/events.js';
 import { trafficPools } from './routes/traffic-pools.js';
+import { isLinkPreviewBot } from './lib/og-bot.js';
 import { meetCallback } from './routes/meet-callback.js';
 import { messageTemplates } from './routes/message-templates.js';
 import dedupPreview from './routes/dedup-preview.js';
 import { profileRefresh } from './routes/profile-refresh.js';
 import { richMenuGroups } from './routes/rich-menu-groups.js';
+import adminVersion from './routes/admin-version.js';
+import adminUpdate from './routes/admin-update.js';
 
 export type Env = {
   Bindings: {
@@ -86,9 +92,29 @@ export type Env = {
     LINE_LOGIN_CHANNEL_ID: string;
     LINE_LOGIN_CHANNEL_SECRET: string;
     WORKER_URL: string;
+    // Admin auth topology (see middleware/admin-auth-config.ts):
+    ADMIN_ORIGIN?: string;          // Comma-separated admin web origin allowlist for credentialed CORS
+    ADMIN_COOKIE_SAMESITE?: string; // Optional override: 'Strict' | 'Lax' | 'None'
+    ADMIN_ALLOW_CROSS_SITE?: string; // 'true' opts into SameSite=None cross-site cookies
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
+    // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
+    // `wrangler secret put`. All are optional at the type level so the rest
+    // of the worker still type-checks in test environments that don't set
+    // them; the /admin/update/* route guards on their presence at runtime.
+    ADMIN_API_KEY?: string;
+    CF_API_TOKEN?: string;
+    CF_ACCOUNT_ID?: string;
+    WORKER_NAME?: string;
+    ADMIN_PAGES_PROJECT?: string;
+    LIFF_PAGES_PROJECT?: string;
+    D1_DATABASE_ID?: string;
+    MANIFEST_URL?: string;
+    WORKER_PUBLIC_URL?: string;
+    ADMIN_PUBLIC_URL?: string;
+    LIFF_PUBLIC_URL?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -97,8 +123,17 @@ export type Env = {
 
 const app = new Hono<Env>();
 
-// CORS — allow all origins for MVP
-app.use('*', cors({ origin: '*' }));
+// CORS — credentialed cookie auth cannot use a wildcard origin. Reflect only
+// same-origin requests and origins on the ADMIN_ORIGIN allowlist; everything
+// else gets no Access-Control-Allow-Origin header (browser blocks it). Bearer
+// SDK/MCP callers send no Origin header and are unaffected.
+app.use('*', cors({
+  origin: (origin, c) => resolveCorsOrigin(c.env, origin, c.req.url),
+  credentials: true,
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+  maxAge: 600,
+}));
 
 // Rate limiting — runs before auth to block abuse early
 app.use('*', rateLimitMiddleware);
@@ -143,6 +178,7 @@ app.route('/', capabilities);
 app.route('/', images);
 app.route('/', setup);
 app.route('/', autoReplies);
+app.route('/', adminAuth);
 app.route('/', trafficPools);
 app.route('/', booking);
 app.route('/', events);
@@ -152,6 +188,16 @@ app.route('/', messageTemplates);
 app.route('/', dedupPreview);
 app.route('/', profileRefresh);
 app.route('/', richMenuGroups);
+
+// Phase 5 (upgrade flow) — public build metadata endpoint. Mounted under
+// /admin/ but intentionally unauthenticated: the dashboard fetches /admin/version
+// before login to render the upgrade banner, and the returned hashes are
+// derivable from the deployed bundle. /admin/update/* (Task 18) layers
+// ADMIN_API_KEY middleware on subpaths.
+app.route('/admin', adminVersion);
+// Phase 5 Task 18 — self-update endpoints guarded by x-admin-api-key.
+// authMiddleware skips non-/api/ paths so this router owns its own auth gate.
+app.route('/admin/update', adminUpdate);
 
 // Self-hosted QR code proxy — prevents leaking ref tokens to third-party services
 app.get('/api/qr', async (c) => {
@@ -182,20 +228,37 @@ app.get('/r/:ref', async (c) => {
   //   1. entry_route.pool_id (if ref maps to a referral link)
   //   2. URL query ?pool=
   //   3. 'main' fallback
-  let liffUrl = c.env.LIFF_URL;
+  let liffUrl = c.env.LIFF_URL || '';
   let pool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
 
   // 1. entry_route lookup. getTrafficPoolById (unlike getTrafficPoolBySlug)
   // does not filter on is_active, so we ignore disabled pools explicitly to
   // honor the operator's pause action.
-  //
-  // NOTE: we intentionally do NOT record a ref_tracking row here. The
-  // /auth/callback + /api/liff/link path already writes a tracking row when
-  // OAuth/LIFF completes, and writing a second landing-page row would
-  // double-count every successful click in getEntryRouteFunnel. Landing-page
-  // drop-off (clicks that never reach OAuth) is therefore not visible in the
-  // funnel; that limitation is intentional pending a dedicated click table.
   const route = await getEntryRouteByRefCode(c.env.DB, ref);
+  let refTrackingId = '';
+  const ua = c.req.header('user-agent') || '';
+  if (route && !isLinkPreviewBot(ua)) {
+    try {
+      const tracking = await recordRefTracking(c.env.DB, {
+        refCode: ref,
+        friendId: null,
+        entryRouteId: route.id,
+        sourceUrl: c.req.header('Referer') || c.req.url,
+        fbclid: c.req.query('fbclid') || null,
+        gclid: c.req.query('gclid') || null,
+        twclid: c.req.query('twclid') || null,
+        ttclid: c.req.query('ttclid') || null,
+        utmSource: c.req.query('utm_source') || null,
+        utmMedium: c.req.query('utm_medium') || null,
+        utmCampaign: c.req.query('utm_campaign') || null,
+        userAgent: ua || null,
+        ipAddress: c.req.header('CF-Connecting-IP') || null,
+      });
+      refTrackingId = tracking.id;
+    } catch (err) {
+      console.error('Failed to record /r click:', err);
+    }
+  }
   if (route?.pool_id) {
     const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
     if (candidate?.is_active) pool = candidate;
@@ -219,11 +282,19 @@ app.get('/r/:ref', async (c) => {
     }
   }
 
+  if (!liffUrl) {
+    const authParams = new URLSearchParams(new URL(c.req.url).search);
+    authParams.set('ref', ref);
+    if (refTrackingId) authParams.set('rt', refTrackingId);
+    return c.redirect(`/auth/line?${authParams.toString()}`, 302);
+  }
+
   // Build LIFF URL with params (direct link for Universal Link)
   const liffIdMatch = liffUrl.match(/liff\.line\.me\/([0-9]+-[A-Za-z0-9]+)/);
   const liffParams = new URLSearchParams();
   if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
   if (ref) liffParams.set('ref', ref);
+  if (refTrackingId) liffParams.set('rt', refTrackingId);
   if (formId) liffParams.set('form', formId);
   const gate = c.req.query('gate');
   if (gate) liffParams.set('gate', gate);
@@ -231,6 +302,10 @@ app.get('/r/:ref', async (c) => {
   if (xh) liffParams.set('xh', xh);
   const ig = c.req.query('ig');
   if (ig) liffParams.set('ig', ig);
+  for (const key of ['gclid', 'fbclid', 'twclid', 'ttclid', 'utm_source', 'utm_medium', 'utm_campaign']) {
+    const value = c.req.query(key);
+    if (value) liffParams.set(key, value);
+  }
   const liffTarget = liffParams.toString() ? `${liffUrl}?${liffParams.toString()}` : liffUrl;
 
   // Help link carries the *resolved* liff target as `t=` so the help page
@@ -240,10 +315,10 @@ app.get('/r/:ref', async (c) => {
   // account than the one originally chosen for this user.
   const helpUrl = `/r/${encodeURIComponent(ref)}/help?t=${encodeURIComponent(liffTarget)}`;
 
-  const ua = (c.req.header('user-agent') || '').toLowerCase();
-  const isMobile = /iphone|ipad|android|mobile/.test(ua);
-  const isIOS = /iphone|ipad|ipod/.test(ua);
-  const isAndroid = /android/.test(ua);
+  const uaLower = ua.toLowerCase();
+  const isMobile = /iphone|ipad|android|mobile/.test(uaLower);
+  const isIOS = /iphone|ipad|ipod/.test(uaLower);
+  const isAndroid = /android/.test(uaLower);
 
   if (isMobile) {
     // OS-aware mobile UI. Per-browser detection (X / IG / FB) intentionally avoided —
@@ -496,14 +571,19 @@ ${longPressBlock}
 app.get('/book', (c) => c.redirect('/?page=book'));
 
 // 404 fallback — API paths return JSON 404, everything else serves from static assets (LIFF/admin)
-app.notFound(async (c) => {
+export const notFoundHandler = async (c: Parameters<typeof app.notFound>[0] extends (ctx: infer C) => unknown ? C : never) => {
   const path = new URL(c.req.url).pathname;
   if (path.startsWith('/api/') || path === '/webhook' || path === '/docs' || path === '/openapi.json') {
     return c.json({ success: false, error: 'Not found' }, 404);
   }
   // Serve static assets (admin dashboard, LIFF pages)
-  return c.env.ASSETS.fetch(c.req.raw);
-});
+  if (c.env.ASSETS && typeof c.env.ASSETS.fetch === 'function') {
+    return c.env.ASSETS.fetch(c.req.raw);
+  }
+  return c.json({ success: false, error: 'Not found' }, 404);
+};
+
+app.notFound(notFoundHandler);
 
 // Scheduled handler for cron triggers — runs for all active LINE accounts
 async function scheduled(

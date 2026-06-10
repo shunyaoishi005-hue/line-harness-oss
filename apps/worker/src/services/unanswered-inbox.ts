@@ -321,6 +321,16 @@ export async function computeUnansweredInbox(
   };
 }
 
+/**
+ * 未対応 (人間が返事してない) friend ID の Set を返す。
+ * /api/chats?unansweredOnly=true で chat list を絞るのに使う。
+ * 判定ロジックは getAllUnansweredRows と同じ source of truth。
+ */
+export async function getUnansweredFriendIds(db: D1Database): Promise<Set<string>> {
+  const rows = await getAllUnansweredRows(db);
+  return new Set(rows.map((r) => r.friendId));
+}
+
 export async function countUnanswered(db: D1Database): Promise<UnansweredCount> {
   const allRows = await getAllUnansweredRows(db);
 

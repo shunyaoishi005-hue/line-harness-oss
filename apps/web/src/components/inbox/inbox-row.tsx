@@ -15,11 +15,7 @@ export interface InboxRowData {
   lastIncomingContent: string
 }
 
-// 注: incoming 画像は webhook.ts で `[画像]` プレーンラベルとして保存されており、
-// LINE Content API でバイナリを取得し R2 等に保存する処理が無い。サムネ表示には
-// その別 spec が必要 (Codex Round 2 指摘で発覚)。当面はラベル表示のみ。
 const TYPE_LABELS: Record<string, string> = {
-  image: '🖼 画像',
   sticker: 'スタンプ',
   video: '🎥 動画',
   audio: '🎤 音声',
@@ -44,23 +40,49 @@ function formatElapsed(iso: string): string {
   return `${day}日前`
 }
 
+function ImageThumb({ raw }: { raw: string }) {
+  // webhook 経由の image は {previewImageUrl, originalContentUrl} JSON。
+  // 過去 incoming の `[画像]` ラベルは parse 失敗 → label fallback。
+  let src: string | undefined
+  try {
+    const parsed = JSON.parse(raw) as {
+      previewImageUrl?: string
+      originalContentUrl?: string
+    }
+    src = parsed.previewImageUrl || parsed.originalContentUrl
+  } catch {
+    // ignore
+  }
+  if (!src) return <span className="text-sm text-gray-600">🖼 画像</span>
+  return (
+    <span className="inline-flex items-center gap-2">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        className="h-12 w-12 flex-shrink-0 rounded object-cover ring-1 ring-gray-200"
+      />
+      <span className="text-sm text-gray-500">🖼 画像</span>
+    </span>
+  )
+}
+
 interface Props {
   row: InboxRowData
 }
 
 export default function InboxRow({ row }: Props) {
-  // 機械応答済バッジ: 直近 incoming の後に machine 応答があったか
   const machineAfterIncoming =
     row.lastMachineAt &&
     new Date(row.lastMachineAt).getTime() > new Date(row.lastIncomingAt).getTime()
 
-  // 1 時間以上待機を強調
   const ms = Date.now() - new Date(row.lastIncomingAt).getTime()
   const isOverdue = ms >= 60 * 60_000
 
   return (
     <Link
-      href={`/chats?friend=${encodeURIComponent(row.friendId)}`}
+      href={`/chats?friend=${encodeURIComponent(row.friendId)}&unanswered=1`}
       className="flex items-start gap-3 border-b border-gray-100 px-4 py-3 hover:bg-gray-50"
     >
       {row.pictureUrl ? (
@@ -87,9 +109,15 @@ export default function InboxRow({ row }: Props) {
             </span>
           )}
         </div>
-        <p className="mt-0.5 truncate text-sm text-gray-600">
-          {formatPreview(row.lastIncomingType, row.lastIncomingContent)}
-        </p>
+        {row.lastIncomingType === 'image' ? (
+          <div className="mt-0.5">
+            <ImageThumb raw={row.lastIncomingContent} />
+          </div>
+        ) : (
+          <p className="mt-0.5 truncate text-sm text-gray-600">
+            {formatPreview(row.lastIncomingType, row.lastIncomingContent)}
+          </p>
+        )}
       </div>
       <div className="flex-shrink-0 text-right">
         <span
