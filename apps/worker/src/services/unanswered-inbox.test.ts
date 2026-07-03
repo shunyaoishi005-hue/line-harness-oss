@@ -11,6 +11,7 @@ interface InboxRow {
   last_incoming: string;
   last_manual: string | null;
   last_machine: string | null;
+  chat_status?: string | null;
   // 旧 schema 互換 (テストヘルパーで preview として recentIncomings に展開する)
   last_incoming_type?: string;
   last_incoming_content?: string;
@@ -129,6 +130,30 @@ describe('computeUnansweredInbox', () => {
     });
     expect(result.page).toBe(1);
     expect(result.pageSize).toBe(50);
+  });
+
+  test('resolved chat is excluded even without manual outgoing', async () => {
+    const db = stubDB({
+      rows: [
+        {
+          friend_id: 'f1',
+          display_name: 'A',
+          picture_url: null,
+          line_account_id: 'a1',
+          account_name: 'L 1',
+          last_incoming: '2026-05-08T10:00:00+09:00',
+          last_manual: null,
+          last_machine: null,
+          chat_status: 'resolved',
+          last_incoming_type: 'text',
+          last_incoming_content: 'free message',
+        },
+      ],
+    });
+
+    const result = await computeUnansweredInbox(db);
+    expect(result.total).toBe(0);
+    expect(result.rows).toHaveLength(0);
   });
 
   test('total と pageSize / page を切り出す', async () => {

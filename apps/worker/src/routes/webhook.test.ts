@@ -41,6 +41,7 @@ vi.mock('../services/step-delivery.js', () => ({
 }));
 
 import { verifySignature } from '@line-crm/line-sdk';
+import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import { webhook } from './webhook.js';
 
 function setupApp() {
@@ -154,5 +155,42 @@ describe('POST /webhook — DoS defenses (#104)', () => {
     expect(res.status).toBe(200);
     // Fast-rejected before any crypto / DB work.
     expect(verifySignature).not.toHaveBeenCalled();
+  });
+});
+
+describe('shouldSkipCompletedInitialDiagnosis', () => {
+  test('skips the Structure initial diagnosis when the friend already has the completion tag', async () => {
+    const first = vi.fn().mockResolvedValue({ '1': 1 });
+    const bind = vi.fn().mockReturnValue({ first });
+    const prepare = vi.fn().mockReturnValue({ bind });
+    const db = { prepare } as unknown as D1Database;
+
+    await expect(
+      shouldSkipCompletedInitialDiagnosis(db, 'friend-1', { name: 'SP_初回診断_v1' }),
+    ).resolves.toBe(true);
+
+    expect(bind).toHaveBeenCalledWith('friend-1', '診断:完了');
+  });
+
+  test('does not skip other friend-add scenarios', async () => {
+    const prepare = vi.fn();
+    const db = { prepare } as unknown as D1Database;
+
+    await expect(
+      shouldSkipCompletedInitialDiagnosis(db, 'friend-1', { name: '別シナリオ' }),
+    ).resolves.toBe(false);
+
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  test('does not skip the initial diagnosis when the completion tag is absent', async () => {
+    const first = vi.fn().mockResolvedValue(null);
+    const bind = vi.fn().mockReturnValue({ first });
+    const prepare = vi.fn().mockReturnValue({ bind });
+    const db = { prepare } as unknown as D1Database;
+
+    await expect(
+      shouldSkipCompletedInitialDiagnosis(db, 'friend-1', { name: 'SP_初回診断_v1' }),
+    ).resolves.toBe(false);
   });
 });

@@ -86,3 +86,11 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: apps/worker
           command: deploy --config dist/line_harness/wrangler.json --name ${{ vars.WORKER_NAME || 'your-worker-name' }}
+
+      - name: Smoke test LINE entry redirects
+        env:
+          LINE_ENTRY_SMOKE_URLS: ${{ vars.LINE_ENTRY_SMOKE_URLS }}
+        run: |
+          urls="${LINE_ENTRY_SMOKE_URLS:-https://line-harness.shunyaoishi-line.workers.dev/r/ref_hp https://line-harness.shunyaoishi-line.workers.dev/r/meta https://line-harness.shunyaoishi-line.workers.dev/r/ref_lp https://line-harness.shunyaoishi-line.workers.dev/r/instagram https://line-harness.shunyaoishi-line.workers.dev/r/manual https://line-harness.shunyaoishi-line.workers.dev/r/referral https://line-harness.shunyaoishi-line.workers.dev/r/lp}"
+          pnpm --filter worker smoke:line-entry -- $urls
+

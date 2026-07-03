@@ -85,6 +85,17 @@ const CANDIDATES_SQL = `
         THEN created_at END) AS last_machine
     FROM messages_log
     GROUP BY friend_id
+  ),
+  latest_chat AS (
+    SELECT friend_id, status
+    FROM (
+      SELECT
+        friend_id,
+        status,
+        ROW_NUMBER() OVER (PARTITION BY friend_id ORDER BY created_at DESC) AS rn
+      FROM chats
+    )
+    WHERE rn = 1
   )
   SELECT
     f.id            AS friend_id,
@@ -94,14 +105,17 @@ const CANDIDATES_SQL = `
     COALESCE(la.name, '(未分類)') AS account_name,
     agg.last_incoming,
     agg.last_manual,
-    agg.last_machine
+    agg.last_machine,
+    COALESCE(lc.status, 'unread') AS chat_status
   FROM friends f
   LEFT JOIN line_accounts la ON la.id = f.line_account_id
   JOIN agg ON agg.friend_id = f.id
+  LEFT JOIN latest_chat lc ON lc.friend_id = f.id
   WHERE f.is_following = 1
     AND (la.id IS NULL OR la.is_active = 1)
     AND agg.last_incoming IS NOT NULL
     AND (agg.last_manual IS NULL OR agg.last_manual < agg.last_incoming)
+    AND COALESCE(lc.status, 'unread') != 'resolved'
   ORDER BY agg.last_incoming ASC
 `;
 
@@ -192,6 +206,7 @@ interface RawCandidateRow {
   last_incoming: string;
   last_manual: string | null;
   last_machine: string | null;
+  chat_status?: string | null;
 }
 
 interface RawIncomingRow {
@@ -232,7 +247,9 @@ function applyFilters(rows: UnansweredRow[], opts: UnansweredInboxOptions): Unan
  */
 async function getAllUnansweredRows(db: D1Database): Promise<UnansweredRow[]> {
   const candidatesResult = await db.prepare(CANDIDATES_SQL).all<RawCandidateRow>();
-  const candidates = candidatesResult.results ?? [];
+  // Operator "resolved" is an explicit manual close. Honor it even when no
+  // source='manual' outgoing exists after the latest incoming.
+  const candidates = (candidatesResult.results ?? []).filter((c) => c.chat_status !== 'resolved');
   if (candidates.length === 0) return [];
 
   // 候補 friend のみを残すための Set。後段の JS group で他の friend は無視する。

@@ -23,6 +23,8 @@ import {
 import { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { sendAdConversions } from './ad-conversion.js';
+import { stopStepDeliveriesForTag } from './step-stop-tags.js';
+import { fillTimerexBookingCodePlaceholder } from './timerex-booking-codes.js';
 
 export interface EventPayload {
   friendId?: string;
@@ -153,8 +155,7 @@ async function processAutomations(
       const conditions = JSON.parse(automation.conditions) as Record<string, unknown>;
       const actions = JSON.parse(automation.actions) as Array<{ type: string; params: Record<string, string> }>;
 
-      // 条件チェック（簡易版: 条件が空なら常にマッチ）
-      if (!matchConditions(conditions, payload)) continue;
+      if (!(await matchConditions(db, conditions, payload))) continue;
 
       const results: Array<{ action: string; success: boolean; error?: string }> = [];
 
@@ -185,10 +186,11 @@ async function processAutomations(
 }
 
 /** 条件マッチング */
-function matchConditions(
+async function matchConditions(
+  db: D1Database,
   conditions: Record<string, unknown>,
   payload: EventPayload,
-): boolean {
+): Promise<boolean> {
   // 条件が空 → 常にマッチ
   if (Object.keys(conditions).length === 0) return true;
 
@@ -203,6 +205,22 @@ function matchConditions(
   // tag_id チェック
   if (conditions.tag_id !== undefined && payload.eventData) {
     if (payload.eventData.tagId !== conditions.tag_id) return false;
+  }
+
+  if (conditions.has_tag_ids !== undefined) {
+    if (!payload.friendId) return false;
+    const tagIds = normalizeStringArray(conditions.has_tag_ids);
+    if (tagIds.length > 0 && !(await friendHasAllTags(db, payload.friendId, tagIds))) {
+      return false;
+    }
+  }
+
+  if (conditions.missing_tag_ids !== undefined) {
+    if (!payload.friendId) return false;
+    const tagIds = normalizeStringArray(conditions.missing_tag_ids);
+    if (tagIds.length > 0 && (await friendHasAnyTag(db, payload.friendId, tagIds))) {
+      return false;
+    }
   }
 
   // keyword チェック（message_received イベント用）
@@ -222,6 +240,33 @@ function matchConditions(
   return true;
 }
 
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
+}
+
+async function countFriendTags(db: D1Database, friendId: string, tagIds: string[]): Promise<number> {
+  if (tagIds.length === 0) return 0;
+  const placeholders = tagIds.map(() => '?').join(', ');
+  const row = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT tag_id) AS count
+       FROM friend_tags
+       WHERE friend_id = ? AND tag_id IN (${placeholders})`,
+    )
+    .bind(friendId, ...tagIds)
+    .first<{ count: number }>();
+  return Number(row?.count ?? 0);
+}
+
+async function friendHasAllTags(db: D1Database, friendId: string, tagIds: string[]): Promise<boolean> {
+  return (await countFriendTags(db, friendId, tagIds)) === tagIds.length;
+}
+
+async function friendHasAnyTag(db: D1Database, friendId: string, tagIds: string[]): Promise<boolean> {
+  return (await countFriendTags(db, friendId, tagIds)) > 0;
+}
+
 /** アクション実行 */
 async function executeAction(
   db: D1Database,
@@ -238,6 +283,7 @@ async function executeAction(
   switch (action.type) {
     case 'add_tag':
       await addTagToFriend(db, friendId!, action.params.tagId);
+      await stopStepDeliveriesForTag(db, friendId!, action.params.tagId);
       break;
 
     case 'remove_tag':
@@ -272,6 +318,12 @@ async function executeAction(
           resolvedContent = tpl.message_content;
         }
       }
+      resolvedContent = await fillTimerexBookingCodePlaceholder(
+        db,
+        resolvedContent,
+        friendId,
+        lineAccountId,
+      );
 
       let msg: Message;
       let logContent: string;

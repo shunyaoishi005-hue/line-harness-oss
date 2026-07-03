@@ -80,6 +80,41 @@ CREATE TABLE affiliates (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE ai_draft_logs (
+  id              TEXT PRIMARY KEY,
+  chat_id         TEXT,
+  friend_id       TEXT,
+  preset_id       TEXT,
+  knowledge_scope TEXT,
+  success         INTEGER NOT NULL DEFAULT 0,
+  accepted        INTEGER NOT NULL DEFAULT 0,
+  error_type      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  accepted_at     TEXT
+);
+
+CREATE TABLE ai_knowledge_items (
+  id              TEXT PRIMARY KEY,
+  client          TEXT NOT NULL,
+  knowledge_scope TEXT NOT NULL,
+  category        TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  tags            TEXT NOT NULL DEFAULT '[]',
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
+CREATE TABLE ai_reply_presets (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  prompt        TEXT NOT NULL,
+  display_order INTEGER NOT NULL DEFAULT 0,
+  is_active     INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
 CREATE TABLE auto_replies (
   id               TEXT PRIMARY KEY,
   keyword          TEXT NOT NULL,
@@ -809,6 +844,15 @@ CREATE INDEX idx_ad_conversion_logs_platform ON ad_conversion_logs (ad_platform_
 CREATE INDEX idx_ad_conversion_logs_status ON ad_conversion_logs (status);
 
 CREATE INDEX idx_affiliate_clicks_affiliate ON affiliate_clicks (affiliate_id);
+
+CREATE INDEX idx_ai_draft_logs_chat_created
+  ON ai_draft_logs (chat_id, created_at);
+
+CREATE INDEX idx_ai_knowledge_scope_active
+  ON ai_knowledge_items (knowledge_scope, is_active);
+
+CREATE INDEX idx_ai_reply_presets_active_order
+  ON ai_reply_presets (is_active, display_order);
 
 CREATE INDEX idx_auto_replies_template_id ON auto_replies(template_id);
 

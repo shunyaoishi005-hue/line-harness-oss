@@ -37,6 +37,7 @@ import type {
 /** Broadcast type from API (now camelCase after worker serialization) */
 export type ApiBroadcast = Omit<Broadcast, 'targetType'> & {
   targetType: BroadcastTargetType;
+  altText: string | null;
   accountIds: string[] | null;
   dedupPriority: string[] | null;
   failedAccountIds: string[] | null;
@@ -71,6 +72,7 @@ if (!API_URL) {
  * cached here.
  */
 export const CSRF_STORAGE_KEY = 'lh_csrf'
+export const API_KEY_STORAGE_KEY = 'lh_api_key'
 
 export function getCsrfToken(): string {
   if (typeof window === 'undefined') return ''
@@ -82,12 +84,20 @@ export function setCsrfToken(token: string | undefined | null): void {
   localStorage.setItem(CSRF_STORAGE_KEY, token)
 }
 
+export function getStoredApiKey(): string {
+  if (typeof window === 'undefined') return ''
+  return localStorage.getItem(API_KEY_STORAGE_KEY) || ''
+}
+
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 export async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
   const method = (options?.method ?? 'GET').toUpperCase()
+  const apiKey = getStoredApiKey()
+  const authHeaders: Record<string, string> = {}
+  if (apiKey) authHeaders.Authorization = `Bearer ${apiKey}`
   const csrfHeaders: Record<string, string> = {}
-  if (MUTATING_METHODS.has(method)) {
+  if (!apiKey && MUTATING_METHODS.has(method)) {
     const token = getCsrfToken()
     if (token) csrfHeaders['X-CSRF-Token'] = token
   }
@@ -97,6 +107,7 @@ export async function fetchApi<T>(path: string, options?: RequestInit): Promise<
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders,
       ...csrfHeaders,
       ...options?.headers,
     },
@@ -283,6 +294,7 @@ export const api = {
       title: string
       messageType: ApiBroadcast['messageType']
       messageContent: string
+      altText?: string | null
       targetType: ApiBroadcast['targetType']
       targetTagId?: string | null
       scheduledAt?: string | null
@@ -304,6 +316,7 @@ export const api = {
         targetType?: ApiBroadcast['targetType']
         targetTagId?: string | null
         scheduledAt?: string | null
+        segmentConditions?: string | null
       }
     ) =>
       fetchApi<ApiResponse<ApiBroadcast>>(`/api/broadcasts/${id}`, {
@@ -690,6 +703,25 @@ export const api = {
       fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
         method: 'POST',
         body: JSON.stringify(data),
+      }),
+    generateAiDraft: (id: string, data: {
+      stylePresetId: string
+      knowledgeScope?: string
+      operatorIntent?: string
+      draftMemo?: string
+    }) =>
+      fetchApi<ApiResponse<{
+        draftId: string
+        draft: string
+        usedKnowledge: string[]
+        warnings: string[]
+      }>>(`/api/chats/${id}/ai-draft`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    acceptAiDraft: (id: string, draftId: string) =>
+      fetchApi<ApiResponse<{ accepted: true }>>(`/api/chats/${id}/ai-draft/${draftId}/accept`, {
+        method: 'POST',
       }),
   },
   reminders: {
@@ -1095,6 +1127,7 @@ export const api = {
 
     // 画像 upload は Content-Type を image/* で送るので fetchApi を使わず直接 fetch。
     uploadImage: async (groupId: string, pageId: string, file: File) => {
+      const apiKey = getStoredApiKey();
       const csrf = getCsrfToken();
       const res = await fetch(
         `${API_URL}/api/rich-menu-groups/${groupId}/pages/${pageId}/image`,
@@ -1103,7 +1136,8 @@ export const api = {
           credentials: 'include',
           headers: {
             'Content-Type': file.type,
-            ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            ...(!apiKey && csrf ? { 'X-CSRF-Token': csrf } : {}),
           },
           body: file,
         },

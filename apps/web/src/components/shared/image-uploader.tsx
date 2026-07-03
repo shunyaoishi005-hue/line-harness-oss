@@ -14,6 +14,7 @@ export interface ImageUploaderProps {
   value: ImageUploaderValue | null
   onChange: (next: ImageUploaderValue | null) => void
   label?: string
+  compact?: boolean
 }
 
 /**
@@ -23,7 +24,7 @@ export interface ImageUploaderProps {
  * mode='line-image' は {originalContentUrl, previewImageUrl} を返す (Broadcast / Auto-reply / Template / Chats)。
  * 初版は preview = original の同 URL。後段で本格 resize が必要になれば worker 側で対応。
  */
-export default function ImageUploader({ mode, value, onChange, label }: ImageUploaderProps) {
+export default function ImageUploader({ mode, value, onChange, label, compact = false }: ImageUploaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -101,6 +102,54 @@ export default function ImageUploader({ mode, value, onChange, label }: ImageUpl
       : value.mode === 'url'
         ? value.url
         : value.previewImageUrl
+
+  if (compact) {
+    return (
+      <div className="space-y-1.5">
+        {label && <div className="text-xs font-medium text-gray-700">{label}</div>}
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={onDrop}
+          onPaste={onPaste}
+          tabIndex={0}
+          className="flex min-h-10 items-center gap-3 rounded-md border border-gray-200 bg-white px-2 py-1.5 focus:border-emerald-500 focus:outline-none"
+        >
+          {previewUrl ? (
+            <>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={previewUrl} alt="" className="h-9 w-9 rounded object-cover ring-1 ring-gray-200" />
+              <button type="button" onClick={() => inputRef.current?.click()} className="text-xs font-medium text-gray-700 underline">
+                差し替え
+              </button>
+              <button type="button" onClick={() => onChange(null)} className="text-xs font-medium text-rose-600 underline">
+                取り消し
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                disabled={busy}
+                className="rounded-md bg-emerald-600 px-2.5 py-1 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {busy ? 'アップロード中...' : '画像を選択'}
+              </button>
+              <span className="hidden text-xs text-gray-400 sm:inline">ドラッグ&ドロップ / Cmd+V</span>
+            </>
+          )}
+          <input
+            ref={inputRef}
+            type="file"
+            accept={mode === 'line-image' ? 'image/jpeg,image/png' : 'image/*'}
+            className="hidden"
+            onChange={(e) => handleFiles(e.target.files)}
+          />
+        </div>
+        {error && <div className="text-xs text-rose-600">{error}</div>}
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-2">

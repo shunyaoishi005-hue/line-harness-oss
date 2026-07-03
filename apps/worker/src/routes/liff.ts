@@ -6,8 +6,8 @@ import {
   linkFriendToUser,
   upsertFriend,
   getEntryRouteByRefCode,
-  recordRefTracking,
   attachRefTrackingToFriend,
+  recordRefTracking,
   addTagToFriend,
   getLineAccountByChannelId,
   getLineAccountById,
@@ -20,6 +20,7 @@ import {
   getMessageTemplateById,
   jstNow,
 } from '@line-crm/db';
+import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import { buildIntroMessage } from '../services/intro-message.js';
 import type { Env } from '../index.js';
 
@@ -314,10 +315,11 @@ liffRoutes.get('/auth/line', async (c) => {
   const utmSource = c.req.query('utm_source') || '';
   const utmMedium = c.req.query('utm_medium') || '';
   const utmCampaign = c.req.query('utm_campaign') || '';
-  const refTrackingId = c.req.query('rt') || '';
   let accountParam = c.req.query('account') || '';
   const uidParam = c.req.query('uid') || ''; // existing user UUID for cross-account linking
   const igParam = c.req.query('ig') || ''; // IG Harness IGSID for cross-platform linking
+  const refTrackingId = c.req.query('rt') || '';
+  const fromRoute = c.req.query('from') === 'r';
   let poolAccount = ''; // pool's channel_id — passed via state only, not accountParam
   const baseUrl = new URL(c.req.url).origin;
 
@@ -386,6 +388,30 @@ liffRoutes.get('/auth/line', async (c) => {
   // The token must reach /auth/callback, so it IS included in the OAuth state (handled by this worker).
   // It must NOT appear in LIFF URLs or QR codes that escape to external domains.
   const externalRef = ref.startsWith('xh:') ? '' : ref;
+  const gateParam = c.req.query('gate') || '';
+  const xhParam2 = c.req.query('xh') || '';
+
+  if (!channelId) {
+    return c.text('LINE Login is not configured', 503);
+  }
+
+  // Build OAuth URL (used as fallback when LIFF is not configured)
+  // Pack all tracking params into state so they survive the OAuth redirect.
+  // The full ref (including xh: tokens) is stored in state — it is opaque to access.line.me
+  // and only decoded by this worker's /auth/callback handler.
+  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam, rt: refTrackingId });
+  const encodedState = btoa(state);
+  const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
+  loginUrl.searchParams.set('response_type', 'code');
+  loginUrl.searchParams.set('client_id', channelId);
+  loginUrl.searchParams.set('redirect_uri', callbackUrl);
+  loginUrl.searchParams.set('scope', 'profile openid email');
+  loginUrl.searchParams.set('bot_prompt', 'aggressive');
+  loginUrl.searchParams.set('state', encodedState);
+
+  if (!liffUrl) {
+    return c.redirect(loginUrl.toString(), 302);
+  }
 
   // Build LIFF URL with ref + ad params (for mobile → LINE app)
   // Extract LIFF ID from URL and pass as query param so the app can init correctly
@@ -395,9 +421,7 @@ liffRoutes.get('/auth/line', async (c) => {
   if (externalRef) liffParams.set('ref', externalRef);
   if (refTrackingId) liffParams.set('rt', refTrackingId);
   if (formId) liffParams.set('form', formId);
-  const gateParam = c.req.query('gate') || '';
   if (gateParam) liffParams.set('gate', gateParam);
-  const xhParam2 = c.req.query('xh') || '';
   if (xhParam2) liffParams.set('xh', xhParam2);
   if (igParam) liffParams.set('ig', igParam);
   if (redirect) liffParams.set('redirect', redirect);
@@ -409,24 +433,6 @@ liffRoutes.get('/auth/line', async (c) => {
   const liffTarget = liffParams.toString()
     ? `${liffUrl}?${liffParams.toString()}`
     : liffUrl;
-
-  // Build OAuth URL (for desktop fallback)
-  // Pack all tracking params into state so they survive the OAuth redirect.
-  // The full ref (including xh: tokens) is stored in state — it is opaque to access.line.me
-  // and only decoded by this worker's /auth/callback handler.
-  // gate / xh: campaign metadata that must reach the form push so the form
-  // can verify against the correct gate via the correct X Harness instance.
-  // Without these, the form falls back to the gateId baked into the form's
-  // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
-  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam, rt: refTrackingId });
-  const encodedState = btoa(state);
-  const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
-  loginUrl.searchParams.set('response_type', 'code');
-  loginUrl.searchParams.set('client_id', channelId);
-  loginUrl.searchParams.set('redirect_uri', callbackUrl);
-  loginUrl.searchParams.set('scope', 'profile openid email');
-  loginUrl.searchParams.set('bot_prompt', 'aggressive');
-  loginUrl.searchParams.set('state', encodedState);
 
   // Build LIFF URL with params (opens LINE app directly on mobile + QR on PC)
   // externalRef used — xh: tokens must not appear in QR codes or LIFF URLs
@@ -461,7 +467,7 @@ liffRoutes.get('/auth/line', async (c) => {
     if (accountParam) {
       return c.redirect(loginUrl.toString());
     }
-    if (externalRef) {
+    if (externalRef && !fromRoute) {
       // Forward all relevant query params (form, gate, xh, ig, pool, redirect, ad ids).
       // ref is already in the path; strip it from the query.
       const reqUrl = new URL(c.req.url);
@@ -472,7 +478,7 @@ liffRoutes.get('/auth/line', async (c) => {
       const qs = passthrough.toString();
       return c.redirect(`/r/${encodeURIComponent(externalRef)}${qs ? '?' + qs : ''}`);
     }
-    return c.redirect(qrUrl);
+    return c.redirect(liffTarget, 302);
   }
 
   // PC: show QR code page
@@ -777,28 +783,11 @@ liffRoutes.get('/auth/callback', async (c) => {
       // Look up entry route config
       const route = await getEntryRouteByRefCode(db, ref);
 
-      // Persist tracking event with ad click IDs. If /r already recorded an
-      // anonymous LP click, attach this friend to that row instead of double counting.
+      // Persist tracking event with ad click IDs. If /r/:ref already recorded
+      // the LP click, attach the friend to that row instead of double-counting.
       const attached = refTrackingId
         ? await attachRefTrackingToFriend(db, {
-            trackingId: refTrackingId,
-            refCode: ref,
-            friendId: friend.id,
-            entryRouteId: route?.id ?? null,
-            sourceUrl: null,
-            fbclid: fbclid || null,
-            gclid: gclid || null,
-            twclid: twclid || null,
-            ttclid: ttclid || null,
-            utmSource: utmSource || null,
-            utmMedium: utmMedium || null,
-            utmCampaign: utmCampaign || null,
-            userAgent: c.req.header('User-Agent') || null,
-            ipAddress: c.req.header('CF-Connecting-IP') || null,
-          })
-        : null;
-      if (!attached) {
-        await recordRefTracking(db, {
+          trackingId: refTrackingId,
           refCode: ref,
           friendId: friend.id,
           entryRouteId: route?.id ?? null,
@@ -812,8 +801,23 @@ liffRoutes.get('/auth/callback', async (c) => {
           utmCampaign: utmCampaign || null,
           userAgent: c.req.header('User-Agent') || null,
           ipAddress: c.req.header('CF-Connecting-IP') || null,
-        });
-      }
+        })
+        : null;
+      if (!attached) await recordRefTracking(db, {
+        refCode: ref,
+        friendId: friend.id,
+        entryRouteId: route?.id ?? null,
+        sourceUrl: null,
+        fbclid: fbclid || null,
+        gclid: gclid || null,
+        twclid: twclid || null,
+        ttclid: ttclid || null,
+        utmSource: utmSource || null,
+        utmMedium: utmMedium || null,
+        utmCampaign: utmCampaign || null,
+        userAgent: c.req.header('User-Agent') || null,
+        ipAddress: c.req.header('CF-Connecting-IP') || null,
+      });
 
       await applyRefAttribution(c, ref, friend, lineUserId, {
         accountChannelId: accountParam || null,
@@ -904,6 +908,11 @@ liffRoutes.get('/auth/callback', async (c) => {
       for (const scenario of scenarios) {
         const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
         if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
+          if (await shouldSkipCompletedInitialDiagnosis(db, friend.id, scenario)) {
+            console.log(`[liff] skip completed initial diagnosis friend=${friend.id} scenario=${scenario.id}`);
+            continue;
+          }
+
           const enrollment = await enroll(db, friend.id, scenario.id);
           if (enrollment) {
             // 即時送信は scenario.delivery_mode を踏まえて「now 以前にスケジュールされる」場合のみ。
@@ -1162,17 +1171,17 @@ liffRoutes.post('/api/liff/link', async (c) => {
       idToken: string;
       displayName?: string | null;
       ref?: string;
+      refTrackingId?: string;
       existingUuid?: string;
-      ig?: string;
       sourceUrl?: string;
-      fbclid?: string;
       gclid?: string;
+      fbclid?: string;
       twclid?: string;
       ttclid?: string;
       utmSource?: string;
       utmMedium?: string;
       utmCampaign?: string;
-      refTrackingId?: string;
+      ig?: string;
     }>();
 
     if (!body.idToken) {
@@ -1233,24 +1242,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
           const route = await getEntryRouteByRefCode(db, body.ref);
           const attached = body.refTrackingId
             ? await attachRefTrackingToFriend(db, {
-                trackingId: body.refTrackingId,
-                refCode: body.ref,
-                friendId: friend.id,
-                entryRouteId: route?.id ?? null,
-                sourceUrl: body.sourceUrl || null,
-                fbclid: body.fbclid || null,
-                gclid: body.gclid || null,
-                twclid: body.twclid || null,
-                ttclid: body.ttclid || null,
-                utmSource: body.utmSource || null,
-                utmMedium: body.utmMedium || null,
-                utmCampaign: body.utmCampaign || null,
-                userAgent: c.req.header('User-Agent') || null,
-                ipAddress: c.req.header('CF-Connecting-IP') || null,
-              })
-            : null;
-          if (!attached) {
-            await recordRefTracking(db, {
+              trackingId: body.refTrackingId,
               refCode: body.ref,
               friendId: friend.id,
               entryRouteId: route?.id ?? null,
@@ -1262,10 +1254,21 @@ liffRoutes.post('/api/liff/link', async (c) => {
               utmSource: body.utmSource || null,
               utmMedium: body.utmMedium || null,
               utmCampaign: body.utmCampaign || null,
-              userAgent: c.req.header('User-Agent') || null,
-              ipAddress: c.req.header('CF-Connecting-IP') || null,
-            });
-          }
+            })
+            : null;
+          if (!attached) await recordRefTracking(db, {
+            refCode: body.ref,
+            friendId: friend.id,
+            entryRouteId: route?.id ?? null,
+            sourceUrl: body.sourceUrl || null,
+            fbclid: body.fbclid || null,
+            gclid: body.gclid || null,
+            twclid: body.twclid || null,
+            ttclid: body.ttclid || null,
+            utmSource: body.utmSource || null,
+            utmMedium: body.utmMedium || null,
+            utmCampaign: body.utmCampaign || null,
+          });
         } catch { /* silent */ }
       }
       if (body.ref) {
@@ -1329,24 +1332,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
         const route = await getEntryRouteByRefCode(db, body.ref);
         const attached = body.refTrackingId
           ? await attachRefTrackingToFriend(db, {
-              trackingId: body.refTrackingId,
-              refCode: body.ref,
-              friendId: friend.id,
-              entryRouteId: route?.id ?? null,
-              sourceUrl: body.sourceUrl || null,
-              fbclid: body.fbclid || null,
-              gclid: body.gclid || null,
-              twclid: body.twclid || null,
-              ttclid: body.ttclid || null,
-              utmSource: body.utmSource || null,
-              utmMedium: body.utmMedium || null,
-              utmCampaign: body.utmCampaign || null,
-              userAgent: c.req.header('User-Agent') || null,
-              ipAddress: c.req.header('CF-Connecting-IP') || null,
-            })
-          : null;
-        if (!attached) {
-          await recordRefTracking(db, {
+            trackingId: body.refTrackingId,
             refCode: body.ref,
             friendId: friend.id,
             entryRouteId: route?.id ?? null,
@@ -1358,10 +1344,21 @@ liffRoutes.post('/api/liff/link', async (c) => {
             utmSource: body.utmSource || null,
             utmMedium: body.utmMedium || null,
             utmCampaign: body.utmCampaign || null,
-            userAgent: c.req.header('User-Agent') || null,
-            ipAddress: c.req.header('CF-Connecting-IP') || null,
-          });
-        }
+          })
+          : null;
+        if (!attached) await recordRefTracking(db, {
+          refCode: body.ref,
+          friendId: friend.id,
+          entryRouteId: route?.id ?? null,
+          sourceUrl: body.sourceUrl || null,
+          fbclid: body.fbclid || null,
+          gclid: body.gclid || null,
+          twclid: body.twclid || null,
+          ttclid: body.ttclid || null,
+          utmSource: body.utmSource || null,
+          utmMedium: body.utmMedium || null,
+          utmCampaign: body.utmCampaign || null,
+        });
       } catch { /* silent */ }
 
       // Apply ref attribution (tag + scenario push) for newly-linked friends

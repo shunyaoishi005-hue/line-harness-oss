@@ -315,9 +315,11 @@ export default function Sidebar() {
             try {
               const apiUrl = process.env.NEXT_PUBLIC_API_URL
               if (apiUrl) {
+                const apiKey = localStorage.getItem('lh_api_key')
                 await fetch(`${apiUrl}/api/auth/logout`, {
                   method: 'POST',
                   credentials: 'include',
+                  headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
                 })
               }
             } catch {

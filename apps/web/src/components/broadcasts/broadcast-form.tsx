@@ -20,10 +20,17 @@ const messageTypeLabels: Record<ApiBroadcast['messageType'], string> = {
   flex: 'Flexメッセージ',
 }
 
+const flexAltTextSuggestions = [
+  '大阪・兵庫・京都の注目案件が動いています',
+  '設計士向け｜今週動いている案件と報酬目安',
+  '気になる案件があれば運営に相談できます',
+]
+
 interface FormState {
   title: string
   messageType: ApiBroadcast['messageType']
   messageContent: string
+  altText: string
   targetType: ApiBroadcast['targetType']
   targetTagId: string
   scheduledAt: string
@@ -49,6 +56,7 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
     title: '',
     messageType: 'text',
     messageContent: '',
+    altText: '',
     targetType: 'all',
     targetTagId: '',
     scheduledAt: '',
@@ -64,6 +72,10 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
     if (!form.messageContent.trim()) { setError('メッセージ内容を入力してください'); return }
     if (form.messageType === 'flex') {
       try { JSON.parse(form.messageContent) } catch { setError('FlexメッセージのJSONが無効です'); return }
+      if (form.altText.trim().length > 400) {
+        setError('代替テキストは400文字以内で入力してください')
+        return
+      }
     }
     if (!form.sendNow && !form.scheduledAt) {
       setError('予約配信の場合は配信日時を指定してください')
@@ -81,6 +93,7 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
         title: form.title,
         messageType: form.messageType,
         messageContent: form.messageContent,
+        altText: form.messageType === 'flex' ? form.altText.trim() || null : null,
         targetType: form.targetType,
         // tag mode: required; multi-account-dedup mode: optional narrowing filter; else: null
         targetTagId:
@@ -150,6 +163,42 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
             ))}
           </div>
         </div>
+
+        {form.messageType === 'flex' && (
+          <div>
+            <div className="flex items-center justify-between gap-3 mb-1">
+              <label className="block text-xs font-medium text-gray-600">
+                代替テキスト（LINE一覧・通知に表示）
+              </label>
+              <span className={`text-[11px] ${form.altText.length > 400 ? 'text-red-500' : 'text-gray-400'}`}>
+                {form.altText.length}/400
+              </span>
+            </div>
+            <input
+              type="text"
+              maxLength={400}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+              placeholder="例: 大阪・兵庫・京都の注目案件が動いています"
+              value={form.altText}
+              onChange={(e) => setForm({ ...form, altText: e.target.value })}
+            />
+            <div className="flex flex-wrap gap-2 mt-2">
+              {flexAltTextSuggestions.map((text) => (
+                <button
+                  key={text}
+                  type="button"
+                  onClick={() => setForm({ ...form, altText: text })}
+                  className="px-2.5 py-1.5 text-[11px] font-medium rounded-md border border-gray-300 text-gray-600 bg-white hover:border-green-400 hover:text-green-700 transition-colors"
+                >
+                  {text}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              未入力の場合はFlex内の最初のテキストが使われます。開封前に見える文言なので、内部ラベルではなくベネフィットが伝わる文章にしてください。
+            </p>
+          </div>
+        )}
 
         {/* Message content */}
         <div>

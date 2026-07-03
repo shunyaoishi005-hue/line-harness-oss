@@ -138,12 +138,12 @@ scenarios.get('/api/scenarios', async (c) => {
     if (lineAccountId) {
       const result = await c.env.DB
         .prepare(
-          `SELECT s.*, COUNT(ss.id) as step_count
-           FROM scenarios s
-           LEFT JOIN scenario_steps ss ON s.id = ss.scenario_id
-           WHERE s.line_account_id IS NULL OR s.line_account_id = ?
-           GROUP BY s.id
-           ORDER BY s.created_at DESC`,
+           `SELECT s.*, COUNT(ss.id) as step_count
+            FROM scenarios s
+            LEFT JOIN scenario_steps ss ON s.id = ss.scenario_id
+            WHERE s.line_account_id IS NULL OR s.line_account_id = ?
+            GROUP BY s.id
+            ORDER BY s.created_at DESC`,
         )
         .bind(lineAccountId)
         .all<DbScenarioWithStepCount>();

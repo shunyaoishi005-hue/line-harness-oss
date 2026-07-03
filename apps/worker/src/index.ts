@@ -22,6 +22,7 @@ import { processDueEventReminders } from './services/event-booking-reminders.js'
 import { runEventBookingExpirer } from './services/event-booking-expirer.js';
 import { sendEventBookingNotification } from './services/event-booking-notifier.js';
 import { sendBookingNotification } from './services/booking-notifier.js';
+import { processDueTimerexReminders } from './services/timerex-reminders.js';
 import { DEFAULT_ACCOUNT_SETTINGS } from './services/booking-types.js';
 import { authMiddleware } from './middleware/auth.js';
 import { rateLimitMiddleware } from './middleware/rate-limit.js';
@@ -77,6 +78,7 @@ import { profileRefresh } from './routes/profile-refresh.js';
 import { richMenuGroups } from './routes/rich-menu-groups.js';
 import adminVersion from './routes/admin-version.js';
 import adminUpdate from './routes/admin-update.js';
+import { timerex } from './routes/timerex.js';
 
 export type Env = {
   Bindings: {
@@ -99,6 +101,12 @@ export type Env = {
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    AI_API_KEY?: string; // Optional: OpenAI-compatible API key for operator AI drafts
+    AI_API_BASE_URL?: string; // Optional: defaults to https://api.openai.com/v1
+    AI_MODEL?: string; // Optional: defaults to gpt-4o-mini
+    OPENAI_API_KEY?: string; // Backward-compatible alias for AI_API_KEY
+    OPENAI_API_BASE_URL?: string; // Backward-compatible alias for AI_API_BASE_URL
+    OPENAI_MODEL?: string; // Backward-compatible alias for AI_MODEL
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest
@@ -188,6 +196,7 @@ app.route('/', messageTemplates);
 app.route('/', dedupPreview);
 app.route('/', profileRefresh);
 app.route('/', richMenuGroups);
+app.route('/', timerex);
 
 // Phase 5 (upgrade flow) — public build metadata endpoint. Mounted under
 // /admin/ but intentionally unauthenticated: the dashboard fetches /admin/version
@@ -234,10 +243,14 @@ app.get('/r/:ref', async (c) => {
   // 1. entry_route lookup. getTrafficPoolById (unlike getTrafficPoolBySlug)
   // does not filter on is_active, so we ignore disabled pools explicitly to
   // honor the operator's pause action.
+  //
+  // Count LP clicks at the /r/:ref landing point. If the user completes LIFF
+  // later, the same row is updated with friend_id so successful clicks are not
+  // double-counted.
   const route = await getEntryRouteByRefCode(c.env.DB, ref);
-  let refTrackingId = '';
+  let refTrackingId = c.req.query('rt') || '';
   const ua = c.req.header('user-agent') || '';
-  if (route && !isLinkPreviewBot(ua)) {
+  if (route && !refTrackingId && !isLinkPreviewBot(ua)) {
     try {
       const tracking = await recordRefTracking(c.env.DB, {
         refCode: ref,
@@ -285,6 +298,7 @@ app.get('/r/:ref', async (c) => {
   if (!liffUrl) {
     const authParams = new URLSearchParams(new URL(c.req.url).search);
     authParams.set('ref', ref);
+    authParams.set('from', 'r');
     if (refTrackingId) authParams.set('rt', refTrackingId);
     return c.redirect(`/auth/line?${authParams.toString()}`, 302);
   }
@@ -682,6 +696,15 @@ async function scheduled(
     } catch (e) {
       console.error('event-booking-expirer error:', e);
     }
+  }
+
+  try {
+    const result = await processDueTimerexReminders(env.DB, { now: new Date() });
+    if (result.sent + result.failed > 0) {
+      console.log(`[timerex-reminders] sent=${result.sent} failed=${result.failed}`);
+    }
+  } catch (e) {
+    console.error('timerex-reminders error:', e);
   }
 
   // Cross-account duplicate detection — disabled.

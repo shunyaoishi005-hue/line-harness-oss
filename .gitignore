@@ -15,3 +15,8 @@ apps/web/out/
 apps/worker/dist/
 .worktrees/
 .claude/worktrees/
+
+# 一時作業・本番データエクスポート（コミット対象外）
+.codex_tmp/
+scenario_flex.json
+auto_reply_flex.json
