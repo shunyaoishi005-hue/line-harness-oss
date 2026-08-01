@@ -10,6 +10,7 @@ on:
       - 'packages/update-engine/**'
       - 'pnpm-lock.yaml'
       - '.github/workflows/worker-ci.yml'
+      - '.github/workflows/deploy-cloudflare-worker.yml'
   push:
     branches: [main]
     paths:
@@ -20,6 +21,7 @@ on:
       - 'packages/update-engine/**'
       - 'pnpm-lock.yaml'
       - '.github/workflows/worker-ci.yml'
+      - '.github/workflows/deploy-cloudflare-worker.yml'
   workflow_dispatch:
 
 permissions:

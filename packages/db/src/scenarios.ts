@@ -512,7 +512,7 @@ export async function advanceFriendScenario(
            next_delivery_at = ?,
            status = 'active',
            updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'delivering'`,
     )
     .bind(nextStepOrder, nextDeliveryAt ?? null, now, id)
     .run();
@@ -533,4 +533,23 @@ export async function completeFriendScenario(
     )
     .bind(now, id)
     .run();
+}
+
+export async function completePendingFriendScenarios(
+  db: D1Database,
+  friendId: string,
+): Promise<number> {
+  const now = jstNow();
+  const result = await db
+    .prepare(
+      `UPDATE friend_scenarios
+       SET status = 'completed',
+           next_delivery_at = NULL,
+           updated_at = ?
+       WHERE friend_id = ?
+         AND status != 'completed'`,
+    )
+    .bind(now, friendId)
+    .run();
+  return result.meta.changes ?? 0;
 }

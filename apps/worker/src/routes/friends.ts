@@ -13,6 +13,7 @@ import {
 import type { Friend as DbFriend, Tag as DbTag } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage } from '../services/step-delivery.js';
+import { stopStepDeliveriesForTag } from '../services/step-stop-tags.js';
 import type { Env } from '../index.js';
 
 const friends = new Hono<Env>();
@@ -79,6 +80,15 @@ function serializeTag(row: DbTag) {
   };
 }
 
+async function isSingleLineAccount(db: D1Database): Promise<boolean> {
+  const row = await db.prepare('SELECT COUNT(*) as count FROM line_accounts').first<{ count: number }>();
+  return (row?.count ?? 0) === 1;
+}
+
+function lineAccountScopeSql(column: string, includeLegacyNull: boolean): string {
+  return includeLegacyNull ? `(${column} = ? OR ${column} IS NULL)` : `${column} = ?`;
+}
+
 // GET /api/friends - list with pagination
 friends.get('/api/friends', async (c) => {
   try {
@@ -120,7 +130,8 @@ friends.get('/api/friends', async (c) => {
       binds.push(tagId);
     }
     if (lineAccountId) {
-      conditions.push('f.line_account_id = ?');
+      const includeLegacyNull = await isSingleLineAccount(db);
+      conditions.push(lineAccountScopeSql('f.line_account_id', includeLegacyNull));
       binds.push(lineAccountId);
     }
     if (search) {
@@ -351,7 +362,12 @@ friends.get('/api/friends/count', async (c) => {
     const lineAccountId = c.req.query('lineAccountId');
     let count: number;
     if (lineAccountId) {
-      const row = await c.env.DB.prepare('SELECT COUNT(*) as count FROM friends WHERE is_following = 1 AND line_account_id = ?')
+      const includeLegacyNull = await isSingleLineAccount(c.env.DB);
+      const row = await c.env.DB.prepare(
+        `SELECT COUNT(*) as count
+         FROM friends
+         WHERE is_following = 1 AND ${lineAccountScopeSql('line_account_id', includeLegacyNull)}`,
+      )
         .bind(lineAccountId).first<{ count: number }>();
       count = row?.count ?? 0;
     } else {
@@ -368,14 +384,20 @@ friends.get('/api/friends/count', async (c) => {
 friends.get('/api/friends/ref-stats', async (c) => {
   try {
     const lineAccountId = c.req.query('lineAccountId');
-    const where = lineAccountId ? 'WHERE line_account_id = ?' : 'WHERE ref_code IS NOT NULL';
-    const binds = lineAccountId ? [lineAccountId] : [];
+    const conditions = ['ref_code IS NOT NULL'];
+    const binds: string[] = [];
+    if (lineAccountId) {
+      const includeLegacyNull = await isSingleLineAccount(c.env.DB);
+      conditions.unshift(lineAccountScopeSql('line_account_id', includeLegacyNull));
+      binds.push(lineAccountId);
+    }
+    const where = `WHERE ${conditions.join(' AND ')}`;
     const stmt = c.env.DB.prepare(
-      `SELECT ref_code, COUNT(*) as count FROM friends ${where} AND ref_code IS NOT NULL GROUP BY ref_code ORDER BY count DESC`,
+      `SELECT ref_code, COUNT(*) as count FROM friends ${where} GROUP BY ref_code ORDER BY count DESC`,
     );
     const result = await (binds.length > 0 ? stmt.bind(...binds) : stmt).all<{ ref_code: string; count: number }>();
     const total = await c.env.DB.prepare(
-      `SELECT COUNT(*) as count FROM friends ${lineAccountId ? 'WHERE line_account_id = ?' : ''} ${lineAccountId ? 'AND' : 'WHERE'} ref_code IS NOT NULL`,
+      `SELECT COUNT(*) as count FROM friends ${where}`,
     ).bind(...(lineAccountId ? [lineAccountId] : [])).first<{ count: number }>();
     return c.json({
       success: true,
@@ -430,6 +452,7 @@ friends.post('/api/friends/:id/tags', async (c) => {
 
     const db = c.env.DB;
     await addTagToFriend(db, friendId, body.tagId);
+    await stopStepDeliveriesForTag(db, friendId, body.tagId);
 
     // Enroll in tag_added scenarios that match this tag
     const allScenarios = await getScenarios(db);

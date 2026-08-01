@@ -1,6 +1,7 @@
 'use client'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { API_KEY_STORAGE_KEY, CSRF_STORAGE_KEY } from '@/lib/api'
 
 export default function LoginPage() {
   const [apiKey, setApiKey] = useState('')
@@ -8,38 +9,44 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const router = useRouter()
 
+  useEffect(() => {
+    const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY)
+    if (savedKey) setApiKey(savedKey)
+  }, [])
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
+    const trimmedApiKey = apiKey.trim()
+    if (!trimmedApiKey) return
+
     setLoading(true)
     setError('')
 
     try {
       const apiUrl = process.env.NEXT_PUBLIC_API_URL
       if (!apiUrl) {
-        setError('NEXT_PUBLIC_API_URL is not set in build env')
+        setError('NEXT_PUBLIC_API_URL が設定されていません')
         setLoading(false)
         return
       }
-      // Exchange the API key for an HttpOnly session cookie. The key is never
-      // stored in localStorage (removes the XSS-exposed credential).
+
       const res = await fetch(`${apiUrl}/api/auth/login`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey }),
+        body: JSON.stringify({ apiKey: trimmedApiKey }),
       })
 
       if (res.ok) {
-        localStorage.removeItem('lh_api_key')
+        localStorage.setItem(API_KEY_STORAGE_KEY, trimmedApiKey)
         try {
           const loginData = await res.json()
           if (loginData.success && loginData.data) {
             localStorage.setItem('lh_staff_name', loginData.data.name)
             localStorage.setItem('lh_staff_role', loginData.data.role)
           }
-          // Cache the CSRF token for mutating requests (double-submit).
           if (loginData.csrfToken) {
-            localStorage.setItem('lh_csrf', loginData.csrfToken)
+            localStorage.setItem(CSRF_STORAGE_KEY, loginData.csrfToken)
           }
         } catch {
           // Profile / CSRF caching is best-effort.
@@ -48,7 +55,6 @@ export default function LoginPage() {
       } else if (res.status === 401) {
         setError('APIキーが正しくありません')
       } else {
-        // Surface topology / configuration errors (e.g. cross-site cookie guard).
         let message = 'ログインに失敗しました'
         try {
           const data = await res.json()
@@ -95,7 +101,7 @@ export default function LoginPage() {
 
           <button
             type="submit"
-            disabled={loading || !apiKey}
+            disabled={loading || !apiKey.trim()}
             className="w-full py-3 text-white font-medium rounded-lg transition-opacity hover:opacity-90 disabled:opacity-50"
             style={{ backgroundColor: '#06C755' }}
           >

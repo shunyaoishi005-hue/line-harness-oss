@@ -107,3 +107,14 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: apps/worker
           command: deploy --config dist/line_harness/wrangler.json --name ${{ vars.WORKER_NAME || 'your-worker-name' }}
+
+      - name: Smoke test LINE entry redirects
+        env:
+          LINE_ENTRY_SMOKE_URLS: ${{ vars.LINE_ENTRY_SMOKE_URLS }}
+        run: |
+          if [ -z "$LINE_ENTRY_SMOKE_URLS" ]; then
+            echo "LINE_ENTRY_SMOKE_URLS repo variable not set - skipping smoke test"
+            exit 0
+          fi
+          pnpm --filter worker smoke:line-entry -- $LINE_ENTRY_SMOKE_URLS
+
