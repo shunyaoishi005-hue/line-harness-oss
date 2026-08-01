@@ -25,10 +25,12 @@ import { fireEvent } from '../services/event-bus.js';
 import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { fillTimerexBookingCodePlaceholder } from '../services/timerex-booking-codes.js';
+import { isTimerexRescheduleIntent } from '../services/timerex-intents.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
 const LINE_SPLIT_TOKEN = '{{line_split}}';
+const GENERIC_TIMEREX_BOOKING_KEYWORDS = new Set(['面談', '予約', '無料面談']);
 
 // LINE webhook bodies are small (events array). Cap defends against unauthenticated
 // large-payload DoS before signature verification (#104). 1 MiB leaves room for
@@ -620,6 +622,10 @@ async function handleEvent(
           ? incomingText === rule.keyword
           : incomingText.includes(rule.keyword);
 
+      if (isMatch && shouldSkipAutoReplyRuleForIncomingText(rule, incomingText)) {
+        continue;
+      }
+
       if (isMatch) {
         // silent タイプ: 返信しないが matched=true にして unread / push を抑止する
         if (rule.response_type === 'silent') {
@@ -701,6 +707,17 @@ async function resolveAutoReplyContent(
     }
   }
   return { messageType: rule.response_type, content: rule.response_content };
+}
+
+function shouldSkipAutoReplyRuleForIncomingText(
+  rule: { keyword: string; match_type: 'exact' | 'contains' },
+  incomingText: string,
+): boolean {
+  return (
+    rule.match_type === 'contains' &&
+    GENERIC_TIMEREX_BOOKING_KEYWORDS.has(rule.keyword) &&
+    isTimerexRescheduleIntent(incomingText)
+  );
 }
 
 function buildAutoReplyMessages(messageType: string, content: string): Message[] {
