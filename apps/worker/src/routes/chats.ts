@@ -103,15 +103,9 @@ const FALLBACK_AI_PRESETS: AiReplyPresetRow[] = [
   },
 ];
 
-const FALLBACK_AI_KNOWLEDGE: AiKnowledgeRow[] = [
-  {
-    id: 'structure_partners_cad_sidejob_2026_06_09',
-    category: '副業CAD案件',
-    tags: '["ストラクチュア","副業CAD","週5時間未満","案件紹介","単価目安"]',
-    content:
-      'ストラクチュアパートナーズでは、副業CAD・図面作成系の案件を紹介できる。週5時間未満の人には、最初から高単価・重めの申請案件を出しすぎず、CAD化・平面図/立面図作成など小さめに試しやすい案件から見せる。案件例: CAD化・平面図/立面図作成は12,000円前後、住宅/実施図面CADオペは35,000円前後、リノベーション図面CADオペは55,000円前後、確認申請まわりの図面作成は75,000〜125,000円前後。LINE上では詳細な顧客名・個人名・内部情報は出しすぎず、気になる案件番号や面談希望を聞いて個別確認へ進める。',
-  },
-];
+// Tenant-specific knowledge lives in the ai_knowledge_items table (seeded per
+// deployment). No baked-in fallback — an empty list just means weaker drafts.
+const FALLBACK_AI_KNOWLEDGE: AiKnowledgeRow[] = [];
 
 function truncateText(value: string, maxLength: number): string {
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
@@ -180,9 +174,9 @@ async function getAiKnowledgeItems(
       .bind(knowledgeScope)
       .all<AiKnowledgeRow>();
     if (result.results.length > 0) return result.results;
-    warnings.push('案件知識DBが未登録のため、内蔵のストラクチュア様案件知識で生成しました。');
+    warnings.push('案件知識DBが未登録のため、登録知識なしで生成しました。');
   } catch {
-    warnings.push('案件知識DBを読めないため、内蔵のストラクチュア様案件知識で生成しました。');
+    warnings.push('案件知識DBを読めないため、登録知識なしで生成しました。');
   }
   return knowledgeScope === DEFAULT_KNOWLEDGE_SCOPE ? FALLBACK_AI_KNOWLEDGE : [];
 }
