@@ -7,6 +7,9 @@ on:
     paths:
       - 'apps/web/**'
       - 'packages/shared/**'
+      - 'packages/update-engine/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
       - '.github/workflows/deploy-cloudflare-admin.yml'
 
 jobs:
@@ -24,12 +27,17 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @line-crm/shared build
+      - run: pnpm --filter @line-crm/shared --filter @line-harness/update-engine build
+
+      - name: Capture build metadata
+        id: build-meta
+        run: echo "build_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Build Admin Panel
         run: pnpm --filter web build
         env:
           NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+          APP_BUILD_TIME: ${{ steps.build-meta.outputs.build_time }}
 
       - name: Deploy to Cloudflare Pages
         env:
