@@ -28,6 +28,7 @@ import { attachTagAndFireSideEffects } from '../services/friend-tag-attach.js';
 import { pushImmediateFirstStep } from '../services/immediate-first-step.js';
 import { notifyAffiliateFriendAdd } from '../services/affiliate-notifier.js';
 import { safeRedirectTarget } from '../lib/safe-redirect.js';
+import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import type { Env } from '../index.js';
 
 const liffRoutes = new Hono<Env>();
@@ -294,6 +295,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const igParam = c.req.query('ig') || ''; // IG Harness IGSID for cross-platform linking
   const igaParam = c.req.query('iga') || ''; // IG Harness business account id
   const iganParam = c.req.query('igan') || ''; // IG Harness business account @username
+  const fromRoute = c.req.query('from') === 'r';
   let poolAccount = ''; // pool's channel_id — passed via state only, not accountParam
   const baseUrl = new URL(c.req.url).origin;
 
@@ -406,6 +408,12 @@ liffRoutes.get('/auth/line', async (c) => {
   loginUrl.searchParams.set('bot_prompt', 'aggressive');
   loginUrl.searchParams.set('state', encodedState);
 
+  // No LIFF configured — OAuth is the only viable path. Redirect straight to
+  // LINE Login (also breaks the /r ↔ /auth/line loop when from=r).
+  if (!liffUrl) {
+    return c.redirect(loginUrl.toString(), 302);
+  }
+
   // Build LIFF URL with params (opens LINE app directly on mobile + QR on PC)
   // externalRef used — xh: tokens must not appear in QR codes or LIFF URLs
   // gate/xh: campaign metadata that the LIFF page must see so it can verify
@@ -441,7 +449,7 @@ liffRoutes.get('/auth/line', async (c) => {
     if (accountParam) {
       return c.redirect(loginUrl.toString());
     }
-    if (externalRef) {
+    if (externalRef && !fromRoute) {
       // Forward all relevant query params (form, gate, xh, ig, pool, redirect, ad ids).
       // ref is already in the path; strip it from the query.
       const reqUrl = new URL(c.req.url);
@@ -899,6 +907,11 @@ liffRoutes.get('/auth/callback', async (c) => {
       for (const scenario of scenarios) {
         const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
         if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
+          if (await shouldSkipCompletedInitialDiagnosis(db, friend.id, scenario)) {
+            console.log(`[liff] skip completed initial diagnosis friend=${friend.id} scenario=${scenario.id}`);
+            continue;
+          }
+
           const enrollment = await enroll(db, friend.id, scenario.id);
           if (enrollment) {
             // 即時送信は scenario.delivery_mode を踏まえて「now 以前にスケジュールされる」場合のみ。

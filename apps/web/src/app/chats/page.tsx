@@ -8,7 +8,6 @@ import { useAccount } from '@/contexts/account-context'
 import Header from '@/components/layout/header'
 import CcPromptButton from '@/components/cc-prompt-button'
 import FlexPreviewComponent from '@/components/flex-preview'
-import FriendInfoSidebar from '@/components/chats/friend-info-sidebar'
 import ImageUploader, { type ImageUploaderValue } from '@/components/shared/image-uploader'
 
 interface Chat {
@@ -61,6 +60,27 @@ const SHOW_LOADING_PREF_KEY = 'lh_chat_show_loading_indicator'
 const CHAT_PAGE_SIZE = 300
 const LOADING_SECONDS_PREF_KEY = 'lh_chat_loading_seconds'
 const LOADING_REFRESH_INTERVAL_MS = 4000
+
+const aiReplyStylePresets = [
+  { id: 'short_polite', label: '丁寧・短め' },
+  { id: 'friendly_hearing', label: '親身にヒアリング' },
+  { id: 'project_intro', label: '案件紹介' },
+  { id: 'meeting_offer', label: '面談誘導' },
+] as const
+
+const aiOperatorIntents = [
+  '案件を紹介したい',
+  '条件を確認したい',
+  '面談につなげたい',
+  '自然に返したい',
+] as const
+
+type AiDraftResult = {
+  draftId: string
+  draft: string
+  usedKnowledge: string[]
+  warnings: string[]
+}
 
 function StickerMessageImage({ content }: { content: string }) {
   const [failed, setFailed] = useState(false)
@@ -328,6 +348,12 @@ export default function ChatsPage() {
   const [error, setError] = useState('')
   const [messageContent, setMessageContent] = useState('')
   const [pendingImage, setPendingImage] = useState<ImageUploaderValue | null>(null)
+  const [aiStylePresetId, setAiStylePresetId] = useState<(typeof aiReplyStylePresets)[number]['id']>('short_polite')
+  const [aiOperatorIntent, setAiOperatorIntent] = useState<(typeof aiOperatorIntents)[number]>('案件を紹介したい')
+  const [aiDraftMemo, setAiDraftMemo] = useState('')
+  const [aiDraft, setAiDraft] = useState<AiDraftResult | null>(null)
+  const [aiDraftLoading, setAiDraftLoading] = useState(false)
+  const [aiDraftError, setAiDraftError] = useState('')
   const [sending, setSending] = useState(false)
   const sendLockRef = useRef(false)
   const [notes, setNotes] = useState('')
@@ -581,6 +607,9 @@ export default function ChatsPage() {
     setSelectedChatId(chatId)
     setMessageContent('')
     setPendingImage(null)
+    setAiDraft(null)
+    setAiDraftError('')
+    setAiDraftMemo('')
   }
 
   const triggerLoadingAnimation = useCallback(async (chatId: string) => {
@@ -755,6 +784,45 @@ export default function ChatsPage() {
     }
   }
 
+  const handleGenerateAiDraft = async () => {
+    if (!selectedChatId || aiDraftLoading) return
+    setAiDraftLoading(true)
+    setAiDraftError('')
+    setAiDraft(null)
+    try {
+      const res = await api.chats.generateAiDraft(selectedChatId, {
+        stylePresetId: aiStylePresetId,
+        knowledgeScope: 'structure_partners',
+        operatorIntent: aiOperatorIntent,
+        draftMemo: aiDraftMemo.trim() || messageContent.trim(),
+      })
+      if (res.success) {
+        setAiDraft(res.data)
+      } else {
+        setAiDraftError(res.error || 'AI返信案の作成に失敗しました')
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      setAiDraftError(`AI返信案の作成に失敗しました: ${detail}`)
+    } finally {
+      setAiDraftLoading(false)
+    }
+  }
+
+  const handleApplyAiDraft = async () => {
+    if (!selectedChatId || !aiDraft) return
+    setMessageContent(aiDraft.draft)
+    const appliedDraftId = aiDraft.draftId
+    setAiDraft(null)
+    setAiDraftError('')
+    requestAnimationFrame(() => textareaRef.current?.focus())
+    try {
+      await api.chats.acceptAiDraft(selectedChatId, appliedDraftId)
+    } catch {
+      // 採用ログだけなので、入力欄反映は成功扱いにする。
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     // IME変換確定のEnterでは送信しない
     if (e.nativeEvent.isComposing || isComposingRef.current || e.keyCode === 229) return
@@ -779,9 +847,9 @@ export default function ChatsPage() {
         </div>
       )}
 
-      <div className="flex gap-4 h-[calc(100vh-120px)] lg:h-[calc(100vh-180px)]">
+      <div className="flex min-h-[640px] gap-4 h-[calc(100dvh-120px)] lg:h-[calc(100dvh-150px)]">
         {/* Left Panel: Chat List */}
-        <div className={`w-full lg:w-96 lg:flex-shrink-0 bg-white rounded-lg shadow-sm border border-gray-200 flex-col overflow-hidden ${selectedChatId ? 'hidden lg:flex' : 'flex'}`}>
+        <div className={`w-full lg:w-80 xl:w-[22rem] lg:flex-shrink-0 bg-white rounded-lg shadow-sm border border-gray-200 flex-col overflow-hidden ${selectedChatId ? 'hidden lg:flex' : 'flex'}`}>
           {/* タブ (全て / 未読 / 対応中 / 解決済) は意図的に削除。直近メッセージが見やすい LINE 風一覧を優先。 */}
 
           {/* Filter row */}
@@ -908,7 +976,7 @@ export default function ChatsPage() {
         </div>
 
         {/* Right Panel: Chat Detail */}
-        <div className={`flex-1 bg-white rounded-lg shadow-sm border border-gray-200 flex-col overflow-hidden ${selectedChatId || selectedFriendId ? 'flex' : 'hidden lg:flex'}`}>
+        <div className={`min-w-0 flex-1 bg-white rounded-lg shadow-sm border border-gray-200 flex-col overflow-hidden ${selectedChatId || selectedFriendId ? 'flex' : 'hidden lg:flex'}`}>
           {selectedFriendId && !selectedChatId ? (
             /* Direct message to friend without existing chat */
             <DirectMessagePanel
@@ -928,7 +996,7 @@ export default function ChatsPage() {
           ) : chatDetail ? (
             <>
               {/* Chat Header */}
-              <div className="px-4 py-4 border-b border-gray-200 flex items-center justify-between gap-2">
+              <div className="px-4 py-3 border-b border-gray-200 flex flex-col items-stretch gap-3 xl:flex-row xl:items-center xl:justify-between">
                 <div className="flex items-center gap-2 min-w-0">
                   <button
                     onClick={() => setSelectedChatId(null)}
@@ -953,7 +1021,7 @@ export default function ChatsPage() {
                     </span>
                   </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2 xl:justify-end">
                   {unansweredOnly && chats.length > 1 && (
                     <button
                       type="button"
@@ -1001,7 +1069,7 @@ export default function ChatsPage() {
               </div>
 
               {/* Messages — LINE-style chat bubbles */}
-              <div ref={messagesScrollRef} className="flex-1 overflow-y-auto p-4 space-y-2" style={{ backgroundColor: '#7494C0' }}>
+              <div ref={messagesScrollRef} className="min-h-0 flex-1 overflow-y-auto p-4 space-y-2" style={{ backgroundColor: '#7494C0' }}>
                 {(!chatDetail.messages || chatDetail.messages.length === 0) ? (
                   <div className="text-center py-8">
                     <p className="text-white/60 text-sm">メッセージはまだありません。</p>
@@ -1081,7 +1149,7 @@ export default function ChatsPage() {
               </div>
 
               {/* Notes */}
-              <div className="px-4 py-2 border-t border-gray-200 bg-gray-50">
+              <div className="shrink-0 px-4 py-2 border-t border-gray-200 bg-gray-50">
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
@@ -1101,7 +1169,93 @@ export default function ChatsPage() {
               </div>
 
               {/* Send Message Form */}
-              <div className="px-4 py-3 border-t border-gray-200">
+              <div className="shrink-0 px-4 py-3 border-t border-gray-200">
+                <div className="mb-2 rounded-lg border border-emerald-100 bg-emerald-50/60 px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={aiStylePresetId}
+                      onChange={(e) => setAiStylePresetId(e.target.value as (typeof aiReplyStylePresets)[number]['id'])}
+                      className="h-9 rounded-md border border-emerald-200 bg-white px-2 text-xs font-medium text-emerald-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    >
+                      {aiReplyStylePresets.map((preset) => (
+                        <option key={preset.id} value={preset.id}>{preset.label}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={aiOperatorIntent}
+                      onChange={(e) => setAiOperatorIntent(e.target.value as (typeof aiOperatorIntents)[number])}
+                      className="h-9 rounded-md border border-emerald-200 bg-white px-2 text-xs text-emerald-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    >
+                      {aiOperatorIntents.map((intent) => (
+                        <option key={intent} value={intent}>{intent}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={aiDraftMemo}
+                      onChange={(e) => setAiDraftMemo(e.target.value)}
+                      placeholder="補足メモ"
+                      className="min-w-[160px] flex-1 rounded-md border border-emerald-200 bg-white px-2 py-2 text-xs text-gray-800 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleGenerateAiDraft}
+                      disabled={aiDraftLoading || !selectedChatId}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <svg className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                        <path d="M10.75 2.75a.75.75 0 0 0-1.5 0v1.5a.75.75 0 0 0 1.5 0v-1.5ZM15.53 5.53a.75.75 0 0 0-1.06-1.06l-1.06 1.06a.75.75 0 1 0 1.06 1.06l1.06-1.06ZM17.25 9.25h-1.5a.75.75 0 0 0 0 1.5h1.5a.75.75 0 0 0 0-1.5ZM14.47 15.53a.75.75 0 1 0 1.06-1.06l-1.06-1.06a.75.75 0 1 0-1.06 1.06l1.06 1.06ZM10.75 15.75a.75.75 0 0 0-1.5 0v1.5a.75.75 0 0 0 1.5 0v-1.5ZM5.53 15.53l1.06-1.06a.75.75 0 0 0-1.06-1.06l-1.06 1.06a.75.75 0 0 0 1.06 1.06ZM4.25 10.75a.75.75 0 0 0 0-1.5h-1.5a.75.75 0 0 0 0 1.5h1.5ZM6.59 6.59a.75.75 0 0 0 0-1.06L5.53 4.47a.75.75 0 0 0-1.06 1.06l1.06 1.06a.75.75 0 0 0 1.06 0ZM10 6.5a3.5 3.5 0 0 0-2.02 6.36c.2.14.32.36.32.6v.04c0 .55.45 1 1 1h1.4c.55 0 1-.45 1-1v-.04c0-.24.12-.46.32-.6A3.5 3.5 0 0 0 10 6.5Z" />
+                      </svg>
+                      {aiDraftLoading ? '生成中...' : 'AI返信案'}
+                    </button>
+                  </div>
+                  {aiDraftError && (
+                    <p className="mt-2 text-xs text-red-600">{aiDraftError}</p>
+                  )}
+                  {aiDraft && (
+                    <div className="mt-2 rounded-md border border-emerald-200 bg-white p-3">
+                      <p className="whitespace-pre-wrap text-sm leading-6 text-gray-900">{aiDraft.draft}</p>
+                      {(aiDraft.usedKnowledge.length > 0 || aiDraft.warnings.length > 0) && (
+                        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                          {aiDraft.usedKnowledge.map((item) => (
+                            <span key={item} className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
+                              {item}
+                            </span>
+                          ))}
+                          {aiDraft.warnings.map((warning) => (
+                            <span key={warning} className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800">
+                              {warning}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="mt-3 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setAiDraft(null)}
+                          className="rounded-md px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-100"
+                        >
+                          閉じる
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleGenerateAiDraft}
+                          disabled={aiDraftLoading}
+                          className="rounded-md px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                        >
+                          再生成
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleApplyAiDraft}
+                          className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                        >
+                          入力欄に反映
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-gray-600">
                   <label className="inline-flex items-center gap-2 cursor-pointer select-none">
                     <input
@@ -1148,6 +1302,7 @@ export default function ChatsPage() {
                     value={pendingImage}
                     onChange={setPendingImage}
                     label="画像を送る (任意)"
+                    compact
                   />
                 </div>
                 <div className="flex items-end gap-2">
@@ -1190,25 +1345,6 @@ export default function ChatsPage() {
           ) : null}
         </div>
 
-        {/* Right-most Panel: 友だち詳細サイドバー — chat detail を開いている時のみ表示 */}
-        {/*
-          friendId は **現在の selection** を優先する。chatDetail の load 中は前の chat
-          のデータが残ったままなので、それを参照するとサイドバーだけ前の友だちを
-          表示し続けて pane 間の不整合になる。selection ID 自体が friend_id なので
-          直接渡せる (chat list SQL が `id: f.id` で friend_id を返す)。
-        */}
-        {(selectedChatId || selectedFriendId) && (
-          <div className="hidden xl:flex">
-            <FriendInfoSidebar
-              friendId={selectedFriendId || selectedChatId}
-              chatStatus={
-                chatDetail && chatDetail.id === (selectedFriendId || selectedChatId)
-                  ? { status: chatDetail.status, notes: chatDetail.notes }
-                  : undefined
-              }
-            />
-          </div>
-        )}
       </div>
       <CcPromptButton prompts={ccPrompts} />
     </div>

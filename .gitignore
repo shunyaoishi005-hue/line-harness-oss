@@ -19,3 +19,8 @@ apps/worker/dist/
 .claude/worktrees/
 .line-harness-setup.json
 .line-harness-config.json
+
+# 一時作業・本番データエクスポート（コミット対象外）
+.codex_tmp/
+scenario_flex.json
+auto_reply_flex.json

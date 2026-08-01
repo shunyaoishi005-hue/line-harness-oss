@@ -16,6 +16,8 @@ import {
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { jitterDeliveryTime, addJitter, sleep } from './stealth.js';
+import { stopStepDeliveriesForTag } from './step-stop-tags.js';
+import { fillTimerexBookingCodePlaceholder } from './timerex-booking-codes.js';
 
 /**
  * Replace template variables in message content.
@@ -233,7 +235,12 @@ async function processSingleDelivery(
   // Expand template variables ({{name}}, {{uid}}, {{auth_url:CHANNEL_ID}}, {{metadata.KEY}}, etc.)
   const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
   const friendWithMeta = { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1];
-  const expandedContent = expandVariables(resolved.messageContent, friendWithMeta, workerUrl, resolved.messageType);
+  const expandedContent = await fillTimerexBookingCodePlaceholder(
+    db,
+    expandVariables(resolved.messageContent, friendWithMeta, workerUrl, resolved.messageType),
+    friend.id,
+    (friend as unknown as Record<string, string | null>).line_account_id,
+  );
   // Auto-wrap URLs with tracking links (text with URLs → Flex with button)
   // リンクの所有アカウントは実際に配信するアカウント (= friend の account) に合わせる
   const friendAccountId = (friend as unknown as Record<string, string | null>).line_account_id;
@@ -292,6 +299,7 @@ async function processSingleDelivery(
   if (currentStep.on_reach_tag_id) {
     try {
       await addTagToFriend(db, friend.id, currentStep.on_reach_tag_id);
+      await stopStepDeliveriesForTag(db, friend.id, currentStep.on_reach_tag_id);
     } catch (err) {
       console.error(`[scenario] tag attach failed step=${currentStep.id}:`, err);
     }

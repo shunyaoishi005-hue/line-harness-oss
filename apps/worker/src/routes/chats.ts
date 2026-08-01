@@ -58,6 +58,306 @@ type ChatLike = {
   updated_at: string;
 };
 
+type AiReplyPresetRow = {
+  id: string;
+  name: string;
+  prompt: string;
+};
+
+type AiKnowledgeRow = {
+  id: string;
+  category: string;
+  content: string;
+  tags: string;
+};
+
+type AiDraftBody = {
+  stylePresetId?: string;
+  knowledgeScope?: string;
+  operatorIntent?: string;
+  draftMemo?: string;
+};
+
+const DEFAULT_KNOWLEDGE_SCOPE = 'structure_partners';
+
+const FALLBACK_AI_PRESETS: AiReplyPresetRow[] = [
+  {
+    id: 'short_polite',
+    name: '丁寧・短め',
+    prompt: '1〜3文で、自然で丁寧に返信してください。相手の発言を受け止め、必要なら次の一歩だけを聞いてください。',
+  },
+  {
+    id: 'friendly_hearing',
+    name: '親身にヒアリング',
+    prompt: '相手の不安や状況に寄り添いながら、稼働時間・CAD経験・希望単価・面談可否のうち不足している情報を1つだけ確認してください。',
+  },
+  {
+    id: 'project_intro',
+    name: '案件紹介',
+    prompt: '相手の条件に近い案件候補を簡潔に紹介してください。単価は必ず目安・前後と表現し、詳細な顧客名や内部情報は出しすぎないでください。',
+  },
+  {
+    id: 'meeting_offer',
+    name: '面談誘導',
+    prompt: '売り込みに見えない自然な流れで、15〜20分ほどの面談相談に誘導してください。相手が断りやすい余白も残してください。',
+  },
+];
+
+// Tenant-specific knowledge lives in the ai_knowledge_items table (seeded per
+// deployment). No baked-in fallback — an empty list just means weaker drafts.
+const FALLBACK_AI_KNOWLEDGE: AiKnowledgeRow[] = [];
+
+function truncateText(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function parseMetadata(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function compactMetadata(metadata: Record<string, unknown>): string {
+  const entries = Object.entries(metadata)
+    .filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== '')
+    .slice(0, 20);
+  if (entries.length === 0) return 'なし';
+  return entries
+    .map(([key, value]) => `${key}: ${truncateText(String(value), 160)}`)
+    .join('\n');
+}
+
+function compactMessageForPrompt(message: { direction: string; message_type: string; content: string; created_at: string }): string {
+  const sender = message.direction === 'incoming' ? '相手' : '運営';
+  if (message.message_type !== 'text') return `${sender}: [${message.message_type}]`;
+  return `${sender}: ${truncateText(message.content.replace(/\s+/g, ' ').trim(), 500)}`;
+}
+
+async function getAiReplyPreset(
+  db: D1Database,
+  presetId: string,
+  warnings: string[],
+): Promise<AiReplyPresetRow> {
+  try {
+    const row = await db
+      .prepare(`SELECT id, name, prompt FROM ai_reply_presets WHERE id = ? AND is_active = 1`)
+      .bind(presetId)
+      .first<AiReplyPresetRow>();
+    if (row) return row;
+    warnings.push('指定された返信スタイルが見つからないため、丁寧・短めで生成しました。');
+  } catch {
+    warnings.push('返信スタイルDBを読めないため、内蔵プリセットで生成しました。');
+  }
+  return FALLBACK_AI_PRESETS.find((preset) => preset.id === presetId) ?? FALLBACK_AI_PRESETS[0];
+}
+
+async function getAiKnowledgeItems(
+  db: D1Database,
+  knowledgeScope: string,
+  warnings: string[],
+): Promise<AiKnowledgeRow[]> {
+  try {
+    const result = await db
+      .prepare(
+        `SELECT id, category, content, tags
+         FROM ai_knowledge_items
+         WHERE knowledge_scope = ? AND is_active = 1
+         ORDER BY category, created_at
+         LIMIT 8`,
+      )
+      .bind(knowledgeScope)
+      .all<AiKnowledgeRow>();
+    if (result.results.length > 0) return result.results;
+    warnings.push('案件知識DBが未登録のため、登録知識なしで生成しました。');
+  } catch {
+    warnings.push('案件知識DBを読めないため、登録知識なしで生成しました。');
+  }
+  return knowledgeScope === DEFAULT_KNOWLEDGE_SCOPE ? FALLBACK_AI_KNOWLEDGE : [];
+}
+
+async function insertAiDraftLog(
+  db: D1Database,
+  input: {
+    chatId: string;
+    friendId: string;
+    presetId: string;
+    knowledgeScope: string;
+    success: boolean;
+    errorType?: string | null;
+  },
+): Promise<string> {
+  const id = crypto.randomUUID();
+  try {
+    await db
+      .prepare(
+        `INSERT INTO ai_draft_logs
+           (id, chat_id, friend_id, preset_id, knowledge_scope, success, accepted, error_type, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      )
+      .bind(
+        id,
+        input.chatId,
+        input.friendId,
+        input.presetId,
+        input.knowledgeScope,
+        input.success ? 1 : 0,
+        input.errorType ?? null,
+        jstNow(),
+      )
+      .run();
+  } catch {
+    // AI本文は保存しない。ログテーブル未適用でも下書き生成は継続する。
+  }
+  return id;
+}
+
+async function markAiDraftAccepted(db: D1Database, draftId: string, chatId: string): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `UPDATE ai_draft_logs
+         SET accepted = 1, accepted_at = ?
+         WHERE id = ? AND chat_id = ?`,
+      )
+      .bind(jstNow(), draftId, chatId)
+      .run();
+  } catch {
+    // Logging-only path.
+  }
+}
+
+function buildAiDraftPrompts(input: {
+  friendName: string;
+  preset: AiReplyPresetRow;
+  notes: string | null;
+  metadata: Record<string, unknown>;
+  messages: Array<{ direction: string; message_type: string; content: string; created_at: string }>;
+  knowledgeItems: AiKnowledgeRow[];
+  operatorIntent: string;
+  draftMemo: string;
+}): { system: string; user: string } {
+  const knowledge = input.knowledgeItems.length
+    ? input.knowledgeItems
+        .map((item) => `- ${item.category}: ${item.content}`)
+        .join('\n')
+    : '登録済み案件知識なし。事実不明な案件詳細は断定せず、確認へ誘導する。';
+
+  const conversation = input.messages.length
+    ? input.messages.map(compactMessageForPrompt).join('\n')
+    : '会話履歴なし';
+
+  return {
+    system: [
+      'あなたはLINEの個別チャットで、運営者の返信下書きを作るアシスタントです。',
+      '出力は送信用本文のみ。前置き、解説、箇条書きタイトル、引用符は不要です。',
+      '事実不明な内容は断定せず、「確認します」「近い案件を確認します」に寄せてください。',
+      '単価は必ず「目安」「前後」と表現し、確約しないでください。',
+      '個人名、顧客名、内部情報、未公開の詳細条件は必要以上に出さないでください。',
+      '条件が不足している場合は、稼働時間・CAD経験・希望単価・面談可否のうち1つだけ質問してください。',
+      '自然な日本語で、LINEに貼って違和感のない長さにしてください。',
+    ].join('\n'),
+    user: [
+      `返信スタイル: ${input.preset.name}`,
+      `スタイル指示: ${input.preset.prompt}`,
+      `相手名: ${input.friendName}`,
+      `オペレーター意図: ${input.operatorIntent || '未指定'}`,
+      `未送信メモ/補足: ${input.draftMemo || 'なし'}`,
+      `チャットメモ: ${input.notes || 'なし'}`,
+      '',
+      '診断回答/メタデータ:',
+      compactMetadata(input.metadata),
+      '',
+      '使ってよい案件知識:',
+      knowledge,
+      '',
+      '直近会話:',
+      conversation,
+      '',
+      '上記を踏まえて、次に送る返信本文だけを作成してください。',
+    ].join('\n'),
+  };
+}
+
+async function generateAiDraftWithModel(
+  env: Env['Bindings'],
+  prompts: { system: string; user: string },
+): Promise<{ draft: string; warnings: string[] }> {
+  const apiKey = env.AI_API_KEY || env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('AI_API_KEY_NOT_CONFIGURED');
+  }
+
+  const baseUrl = (env.AI_API_BASE_URL || env.OPENAI_API_BASE_URL || 'https://api.openai.com/v1')
+    .replace(/\/+$/, '');
+  const model = env.AI_MODEL || env.OPENAI_MODEL || 'gpt-4o-mini';
+
+  const callModel = async (userPrompt: string, maxTokens: number) => {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.35,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: prompts.system },
+          { role: 'user', content: userPrompt },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const detail = truncateText(await response.text(), 500);
+      throw new Error(`AI_PROVIDER_ERROR:${response.status}:${detail}`);
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ finish_reason?: string; message?: { content?: string } }>;
+    };
+    const draft = data.choices?.[0]?.message?.content?.trim();
+    if (!draft) throw new Error('AI_EMPTY_DRAFT');
+    return {
+      draft: draft.replace(/^["「]+|["」]+$/g, '').trim(),
+      finishReason: data.choices?.[0]?.finish_reason ?? null,
+    };
+  };
+
+  const isLikelyIncomplete = (draft: string): boolean => {
+    const trimmed = draft.trim();
+    if (!trimmed) return true;
+    if (/[。！？!?）)」』]$/.test(trimmed)) return false;
+    return /[ぁ-んァ-ヶ一-龠A-Za-z0-9]$/.test(trimmed);
+  };
+
+  const first = await callModel(
+    `${prompts.user}\n\n制約: 返信本文は最大4文まで。最後の文まで必ず完結させ、文の途中で終えないでください。`,
+    1200,
+  );
+  if (first.finishReason !== 'length' && !isLikelyIncomplete(first.draft)) {
+    return { draft: first.draft, warnings: [] };
+  }
+
+  const retry = await callModel(
+    `${prompts.user}\n\n重要: 前回の返信案が途中で切れた可能性があります。返信本文だけを、最大3文で、必ず句点まで完結させて作り直してください。`,
+    1600,
+  );
+  return {
+    draft: retry.draft,
+    warnings: retry.finishReason === 'length' || isLikelyIncomplete(retry.draft)
+      ? ['AIの出力が途中で切れた可能性があります。再生成してください。']
+      : [],
+  };
+}
+
 // id は chats.id もしくは friend.id のどちらか。friend.id のときは chats 行を遅延作成する。
 // push / broadcast / scenario 配信だけを受けた友だちもチャット画面に現れるため、ここで lazy create が必要。
 // 新規作成する場合は status='resolved' にし、last_message_at は messages_log の実際の最終時刻を使う
@@ -555,6 +855,114 @@ chats.post('/api/chats/:id/loading', async (c) => {
     console.error('POST /api/chats/:id/loading error:', err);
     const message = err instanceof Error ? err.message : 'Internal server error';
     return c.json({ success: false, error: message }, 500);
+  }
+});
+
+// AI返信下書き生成（送信はしない）
+chats.post('/api/chats/:id/ai-draft', async (c) => {
+  const warnings: string[] = [];
+  let logContext: {
+    chatId: string;
+    friendId: string;
+    presetId: string;
+    knowledgeScope: string;
+  } | null = null;
+
+  try {
+    const rawId = c.req.param('id');
+    const chat = await resolveOrCreateChat(c.env.DB, rawId);
+    if (!chat) return c.json({ success: false, error: 'Chat not found' }, 404);
+
+    let body: AiDraftBody = {};
+    try {
+      body = await c.req.json<AiDraftBody>();
+    } catch {
+      body = {};
+    }
+    const presetId = body.stylePresetId || 'short_polite';
+    const knowledgeScope = body.knowledgeScope || DEFAULT_KNOWLEDGE_SCOPE;
+    logContext = { chatId: chat.id, friendId: chat.friend_id, presetId, knowledgeScope };
+
+    const preset = await getAiReplyPreset(c.env.DB, presetId, warnings);
+    const knowledgeItems = await getAiKnowledgeItems(c.env.DB, knowledgeScope, warnings);
+
+    const friend = await c.env.DB
+      .prepare(`SELECT display_name, metadata FROM friends WHERE id = ?`)
+      .bind(chat.friend_id)
+      .first<{ display_name: string | null; metadata: string | null }>();
+    if (!friend) return c.json({ success: false, error: 'Friend not found' }, 404);
+
+    const messages = await c.env.DB
+      .prepare(
+        `SELECT direction, message_type, content, created_at
+         FROM messages_log
+         WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
+         ORDER BY created_at DESC
+         LIMIT 24`,
+      )
+      .bind(chat.friend_id)
+      .all<{ direction: string; message_type: string; content: string; created_at: string }>();
+
+    const prompts = buildAiDraftPrompts({
+      friendName: friend.display_name || '名前なし',
+      preset,
+      notes: chat.notes,
+      metadata: parseMetadata(friend.metadata),
+      messages: [...messages.results].reverse(),
+      knowledgeItems,
+      operatorIntent: body.operatorIntent?.trim() || '',
+      draftMemo: body.draftMemo?.trim() || '',
+    });
+
+    const generated = await generateAiDraftWithModel(c.env, prompts);
+    warnings.push(...generated.warnings);
+    const draftId = await insertAiDraftLog(c.env.DB, {
+      ...logContext,
+      success: true,
+    });
+
+    return c.json({
+      success: true,
+      data: {
+        draftId,
+        draft: generated.draft,
+        usedKnowledge: knowledgeItems.map((item) => item.category),
+        warnings,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal server error';
+    if (logContext) {
+      await insertAiDraftLog(c.env.DB, {
+        ...logContext,
+        success: false,
+        errorType: message.split(':')[0],
+      });
+    }
+    console.error('POST /api/chats/:id/ai-draft error:', err);
+    if (message === 'AI_API_KEY_NOT_CONFIGURED') {
+      return c.json({
+        success: false,
+        error: 'AI draft generation is not configured',
+      }, 503);
+    }
+    return c.json({
+      success: false,
+      error: 'AI draft generation failed',
+    }, 500);
+  }
+});
+
+// AI下書きを入力欄へ反映したことだけを記録する。本文は保存しない。
+chats.post('/api/chats/:id/ai-draft/:draftId/accept', async (c) => {
+  try {
+    const chat = await resolveOrCreateChat(c.env.DB, c.req.param('id'));
+    if (!chat) return c.json({ success: false, error: 'Chat not found' }, 404);
+    await markAiDraftAccepted(c.env.DB, c.req.param('draftId'), chat.id);
+    return c.json({ success: true, data: { accepted: true } });
+  } catch (err) {
+    console.error('POST /api/chats/:id/ai-draft/:draftId/accept error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
 

@@ -8,12 +8,15 @@ interface CapturedInsert {
 
 function fakeDb(opts: {
   friend?: { line_user_id: string };
+  friendTagIds?: string[];
   capturedInserts: CapturedInsert[];
 }): D1Database {
   return {
     prepare(sql: string) {
+      let boundArgs: unknown[] = [];
       return {
         bind(...args: unknown[]) {
+          boundArgs = args;
           if (sql.includes('INSERT INTO messages_log')) {
             opts.capturedInserts.push({ sql, binds: args });
           }
@@ -25,6 +28,12 @@ function fakeDb(opts: {
         async first<T>(): Promise<T | null> {
           if (sql.includes('FROM friends WHERE id')) {
             return (opts.friend ?? null) as T | null;
+          }
+          if (sql.includes('FROM friend_tags')) {
+            const requestedTagIds = boundArgs.slice(1).filter((v): v is string => typeof v === 'string');
+            const friendTagIds = new Set(opts.friendTagIds ?? []);
+            const count = requestedTagIds.filter((tagId) => friendTagIds.has(tagId)).length;
+            return { count } as T;
           }
           return null;
         },
@@ -223,5 +232,185 @@ describe('fireEvent — send_message action logging', () => {
     // log には template から取得した messageType / content が記録される
     expect(captured[0].binds[2]).toBe('flex');
     expect(String(captured[0].binds[3])).toContain('from-template');
+  });
+
+  it('matches automations only when all has_tag_ids are attached to the friend', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: 'auto-tags',
+        line_account_id: null,
+        conditions: JSON.stringify({
+          keyword_exact: '診断Q4:副業案件',
+          has_tag_ids: ['hours-under-5', 'skill-cad'],
+        }),
+        actions: JSON.stringify([
+          {
+            type: 'send_message',
+            params: { messageType: 'text', content: 'CAD向け案件です' },
+          },
+        ]),
+      },
+    ]);
+
+    const dbFake = fakeDb({
+      friend: { line_user_id: 'U_test' },
+      friendTagIds: ['hours-under-5', 'skill-cad'],
+      capturedInserts: captured,
+    });
+    await fireEvent(
+      dbFake,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '診断Q4:副業案件' } },
+      'channel-token',
+      null,
+    );
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].binds[3]).toBe('CAD向け案件です');
+  });
+
+  it('skips automations when a required has_tag_ids value is missing', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: 'auto-tags-missing',
+        line_account_id: null,
+        conditions: JSON.stringify({
+          keyword_exact: '診断Q4:副業案件',
+          has_tag_ids: ['hours-under-5', 'skill-cad'],
+        }),
+        actions: JSON.stringify([
+          {
+            type: 'send_message',
+            params: { messageType: 'text', content: 'CAD向け案件です' },
+          },
+        ]),
+      },
+    ]);
+
+    const dbFake = fakeDb({
+      friend: { line_user_id: 'U_test' },
+      friendTagIds: ['hours-under-5'],
+      capturedInserts: captured,
+    });
+    await fireEvent(
+      dbFake,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '診断Q4:副業案件' } },
+      'channel-token',
+      null,
+    );
+
+    expect(captured).toHaveLength(0);
+  });
+
+  it('skips automations when a missing_tag_ids value is attached', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: 'auto-missing-tags',
+        line_account_id: null,
+        conditions: JSON.stringify({
+          keyword_exact: '診断Q4:副業案件',
+          missing_tag_ids: ['already-sent'],
+        }),
+        actions: JSON.stringify([
+          {
+            type: 'send_message',
+            params: { messageType: 'text', content: '初回だけ送る案件です' },
+          },
+        ]),
+      },
+    ]);
+
+    const dbFake = fakeDb({
+      friend: { line_user_id: 'U_test' },
+      friendTagIds: ['already-sent'],
+      capturedInserts: captured,
+    });
+    await fireEvent(
+      dbFake,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '診断Q4:副業案件' } },
+      'channel-token',
+      null,
+    );
+
+    expect(captured).toHaveLength(0);
+  });
+  it('splits text automation messages on {{line_split}} before sending and logging', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: 'auto-line-split',
+        line_account_id: null,
+        conditions: JSON.stringify({ keyword: '無料面談' }),
+        actions: JSON.stringify([
+          {
+            type: 'send_message',
+            params: {
+              messageType: 'text',
+              content: '予約はこちらです\n{{line_split}}\nSP-ABC123\n{{line_split}}\n予約できたら「予約完了」と送ってください。',
+            },
+          },
+        ]),
+      },
+    ]);
+
+    const dbFake = fakeDb({
+      friend: { line_user_id: 'U_test' },
+      capturedInserts: captured,
+    });
+    await fireEvent(
+      dbFake,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '無料面談' }, replyToken: 'reply-token-xyz' },
+      'channel-token',
+      null,
+    );
+
+    expect(captured).toHaveLength(3);
+    expect(captured.map((row) => row.binds[3])).toEqual([
+      '予約はこちらです',
+      'SP-ABC123',
+      '予約できたら「予約完了」と送ってください。',
+    ]);
+    expect(captured.some((row) => String(row.binds[3]).includes('{{line_split}}'))).toBe(false);
+  });
+
+  it('treats natural reschedule wording as the 日程変更 automation keyword', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: 'auto-reschedule',
+        line_account_id: null,
+        conditions: JSON.stringify({ keyword: '日程変更' }),
+        actions: JSON.stringify([
+          {
+            type: 'send_message',
+            params: { messageType: 'text', content: '日程変更のご連絡ありがとうございます。再予約はこちらです。' },
+          },
+        ]),
+      },
+    ]);
+
+    const dbFake = fakeDb({
+      friend: { line_user_id: 'U_test' },
+      capturedInserts: captured,
+    });
+    await fireEvent(
+      dbFake,
+      'message_received',
+      {
+        friendId: 'friend-1',
+        eventData: { text: '申し訳ございません。17時半からの面談につきましては時間に間に合わない為日程を変更させてください。' },
+      },
+      'channel-token',
+      null,
+    );
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].binds[3]).toBe('日程変更のご連絡ありがとうございます。再予約はこちらです。');
   });
 });

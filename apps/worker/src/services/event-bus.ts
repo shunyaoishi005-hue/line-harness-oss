@@ -23,6 +23,11 @@ import {
 import { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { sendAdConversions } from './ad-conversion.js';
+import { stopStepDeliveriesForTag } from './step-stop-tags.js';
+import { fillTimerexBookingCodePlaceholder } from './timerex-booking-codes.js';
+import { isTimerexRescheduleIntent } from './timerex-intents.js';
+
+const LINE_SPLIT_TOKEN = '{{line_split}}';
 
 export interface EventPayload {
   friendId?: string;
@@ -153,8 +158,7 @@ async function processAutomations(
       const conditions = JSON.parse(automation.conditions) as Record<string, unknown>;
       const actions = JSON.parse(automation.actions) as Array<{ type: string; params: Record<string, string> }>;
 
-      // 条件チェック（簡易版: 条件が空なら常にマッチ）
-      if (!matchConditions(conditions, payload)) continue;
+      if (!(await matchConditions(db, conditions, payload))) continue;
 
       const results: Array<{ action: string; success: boolean; error?: string }> = [];
 
@@ -185,10 +189,11 @@ async function processAutomations(
 }
 
 /** 条件マッチング */
-function matchConditions(
+async function matchConditions(
+  db: D1Database,
   conditions: Record<string, unknown>,
   payload: EventPayload,
-): boolean {
+): Promise<boolean> {
   // 条件が空 → 常にマッチ
   if (Object.keys(conditions).length === 0) return true;
 
@@ -205,10 +210,29 @@ function matchConditions(
     if (payload.eventData.tagId !== conditions.tag_id) return false;
   }
 
+  if (conditions.has_tag_ids !== undefined) {
+    if (!payload.friendId) return false;
+    const tagIds = normalizeStringArray(conditions.has_tag_ids);
+    if (tagIds.length > 0 && !(await friendHasAllTags(db, payload.friendId, tagIds))) {
+      return false;
+    }
+  }
+
+  if (conditions.missing_tag_ids !== undefined) {
+    if (!payload.friendId) return false;
+    const tagIds = normalizeStringArray(conditions.missing_tag_ids);
+    if (tagIds.length > 0 && (await friendHasAnyTag(db, payload.friendId, tagIds))) {
+      return false;
+    }
+  }
+
   // keyword チェック（message_received イベント用）
   if (conditions.keyword !== undefined && payload.eventData) {
     const text = payload.eventData.text as string | undefined;
-    if (!text || !text.includes(conditions.keyword as string)) return false;
+    const keyword = conditions.keyword as string;
+    const matchesKeyword = !!text && text.includes(keyword);
+    const matchesTimerexReschedule = keyword === '日程変更' && !!text && isTimerexRescheduleIntent(text);
+    if (!matchesKeyword && !matchesTimerexReschedule) return false;
   }
 
   // keyword_exact（完全一致）
@@ -221,6 +245,33 @@ function matchConditions(
   }
 
   return true;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
+}
+
+async function countFriendTags(db: D1Database, friendId: string, tagIds: string[]): Promise<number> {
+  if (tagIds.length === 0) return 0;
+  const placeholders = tagIds.map(() => '?').join(', ');
+  const row = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT tag_id) AS count
+       FROM friend_tags
+       WHERE friend_id = ? AND tag_id IN (${placeholders})`,
+    )
+    .bind(friendId, ...tagIds)
+    .first<{ count: number }>();
+  return Number(row?.count ?? 0);
+}
+
+async function friendHasAllTags(db: D1Database, friendId: string, tagIds: string[]): Promise<boolean> {
+  return (await countFriendTags(db, friendId, tagIds)) === tagIds.length;
+}
+
+async function friendHasAnyTag(db: D1Database, friendId: string, tagIds: string[]): Promise<boolean> {
+  return (await countFriendTags(db, friendId, tagIds)) > 0;
 }
 
 /** アクション実行 */
@@ -239,6 +290,7 @@ async function executeAction(
   switch (action.type) {
     case 'add_tag':
       await addTagToFriend(db, friendId!, action.params.tagId);
+      await stopStepDeliveriesForTag(db, friendId!, action.params.tagId);
       break;
 
     case 'remove_tag':
@@ -273,61 +325,49 @@ async function executeAction(
           resolvedContent = tpl.message_content;
         }
       }
+      resolvedContent = await fillTimerexBookingCodePlaceholder(
+        db,
+        resolvedContent,
+        friendId,
+        lineAccountId,
+      );
 
-      let msg: Message;
-      let logContent: string;
-      if (resolvedType === 'flex') {
-        const contents = JSON.parse(resolvedContent);
-        msg = { type: 'flex', altText: action.params.altText || extractFlexAltText(contents), contents };
-        logContent = JSON.stringify(contents);
-      } else if (resolvedType === 'image') {
-        // template に "originalContentUrl" / "previewImageUrl" を持つ JSON が入る前提。
-        // parse 失敗時は text fallback ではなく throw → automation 側で partial 扱いにする。
-        const parsed = JSON.parse(resolvedContent) as { originalContentUrl: string; previewImageUrl: string };
-        msg = {
-          type: 'image',
-          originalContentUrl: parsed.originalContentUrl,
-          previewImageUrl: parsed.previewImageUrl,
-        };
-        logContent = JSON.stringify(parsed);
-      } else {
-        msg = { type: 'text', text: resolvedContent };
-        logContent = resolvedContent;
-      }
+      const outgoingMessages = buildAutomationMessages(resolvedType, resolvedContent, action.params.altText);
+      const lineMessages = outgoingMessages.map((item) => item.message);
 
       let deliveryType: 'reply' | 'push';
       if (payload.replyToken) {
         try {
-          await lineClient.replyMessage(payload.replyToken, [msg]);
+          await lineClient.replyMessage(payload.replyToken, lineMessages);
           payload.replyToken = undefined;
           deliveryType = 'reply';
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err);
           const isTokenError = errMsg.includes('400') || errMsg.includes('Invalid reply token');
           if (isTokenError) {
-            await lineClient.pushMessage(friend.line_user_id, [msg]);
+            await lineClient.pushMessage(friend.line_user_id, lineMessages);
             deliveryType = 'push';
           } else {
             throw err;
           }
         }
       } else {
-        await lineClient.pushMessage(friend.line_user_id, [msg]);
+        await lineClient.pushMessage(friend.line_user_id, lineMessages);
         deliveryType = 'push';
       }
 
-      // log は実際に送信した msg の type を反映する。msgType が 'image' 等で
-      // else 経路に入った場合、actual message は text なので 'text' で記録すべき。
-      // params の messageType をそのまま使うと admin 側で画像/Flex プレースホルダ
-      // が出てしまう。
-      await logOutgoingMessage(db, {
-        friendId,
-        messageType: msg.type,
-        content: logContent,
-        deliveryType,
-        source: 'automation',
-        lineAccountId,
-      });
+      // log は実際に送信した message の type / content を反映する。
+      // {{line_split}} で分割した場合も、管理画面には送信済みの各通をそのまま残す。
+      for (const item of outgoingMessages) {
+        await logOutgoingMessage(db, {
+          friendId,
+          messageType: item.message.type,
+          content: item.logContent,
+          deliveryType,
+          source: 'automation',
+          lineAccountId,
+        });
+      }
       break;
     }
 
@@ -401,6 +441,56 @@ async function executeAction(
   }
 }
 
+type AutomationMessageForLog = {
+  message: Message;
+  logContent: string;
+};
+
+function buildAutomationMessages(messageType: string, messageContent: string, altText?: string): AutomationMessageForLog[] {
+  if (messageType === 'text') {
+    return splitLineTextContent(messageContent).map((part) => ({
+      message: { type: 'text', text: part },
+      logContent: part,
+    }));
+  }
+
+  if (messageType === 'flex') {
+    const contents = JSON.parse(messageContent);
+    return [{
+      message: { type: 'flex', altText: altText || extractFlexAltText(contents), contents },
+      logContent: JSON.stringify(contents),
+    }];
+  }
+
+  if (messageType === 'image') {
+    // template に "originalContentUrl" / "previewImageUrl" を持つ JSON が入る前提。
+    // parse 失敗時は text fallback ではなく throw → automation 側で partial 扱いにする。
+    const parsed = JSON.parse(messageContent) as { originalContentUrl: string; previewImageUrl: string };
+    return [{
+      message: {
+        type: 'image',
+        originalContentUrl: parsed.originalContentUrl,
+        previewImageUrl: parsed.previewImageUrl,
+      },
+      logContent: JSON.stringify(parsed),
+    }];
+  }
+
+  return [{
+    message: { type: 'text', text: messageContent },
+    logContent: messageContent,
+  }];
+}
+
+function splitLineTextContent(content: string): string[] {
+  if (!content.includes(LINE_SPLIT_TOKEN)) return [content];
+  const parts = content
+    .split(LINE_SPLIT_TOKEN)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  return parts.length > 0 ? parts : [''];
+}
 /** 送信メッセージを messages_log に記録（失敗しても例外を上げない） */
 async function logOutgoingMessage(
   db: D1Database,

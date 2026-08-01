@@ -14,6 +14,7 @@ import {
   toJstString,
 } from '@line-crm/db';
 import { LineClient } from '@line-crm/line-sdk';
+import { fillTimerexBookingCodePlaceholder } from './timerex-booking-codes.js';
 import {
   buildMessage,
   expandVariables,
@@ -285,11 +286,16 @@ export async function pushImmediateFirstStep(
       resolveMetadata(db, { user_id: friend.user_id, metadata: friend.metadata }),
       resolveStepContent(db, firstStep),
     ]);
-    const expanded = expandVariables(
-      resolved.messageContent,
-      { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
-      ctx.workerUrl,
-      resolved.messageType,
+    const expanded = await fillTimerexBookingCodePlaceholder(
+      db,
+      expandVariables(
+        resolved.messageContent,
+        { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
+        ctx.workerUrl,
+        resolved.messageType,
+      ),
+      friend.id,
+      friend.line_account_id ?? null,
     );
     const sentMessage = buildMessage(resolved.messageType, expanded);
 

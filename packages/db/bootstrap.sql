@@ -105,6 +105,41 @@ CREATE TABLE affiliates (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE ai_draft_logs (
+  id              TEXT PRIMARY KEY,
+  chat_id         TEXT,
+  friend_id       TEXT,
+  preset_id       TEXT,
+  knowledge_scope TEXT,
+  success         INTEGER NOT NULL DEFAULT 0,
+  accepted        INTEGER NOT NULL DEFAULT 0,
+  error_type      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  accepted_at     TEXT
+);
+
+CREATE TABLE ai_knowledge_items (
+  id              TEXT PRIMARY KEY,
+  client          TEXT NOT NULL,
+  knowledge_scope TEXT NOT NULL,
+  category        TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  tags            TEXT NOT NULL DEFAULT '[]',
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
+CREATE TABLE ai_reply_presets (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  prompt        TEXT NOT NULL,
+  display_order INTEGER NOT NULL DEFAULT 0,
+  is_active     INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
 CREATE TABLE auto_replies (
   id               TEXT PRIMARY KEY,
   keyword          TEXT NOT NULL,
@@ -790,6 +825,64 @@ CREATE TABLE templates (
   updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE timerex_booking_codes (
+  id              TEXT PRIMARY KEY,
+  line_account_id TEXT NOT NULL REFERENCES line_accounts(id) ON DELETE CASCADE,
+  friend_id       TEXT NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
+  code            TEXT NOT NULL,
+  last_booking_id TEXT REFERENCES timerex_bookings(id) ON DELETE SET NULL,
+  last_used_at    TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  UNIQUE(line_account_id, friend_id),
+  UNIQUE(line_account_id, code)
+);
+
+CREATE TABLE timerex_booking_reminders (
+  id            TEXT PRIMARY KEY,
+  booking_id    TEXT NOT NULL REFERENCES timerex_bookings(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('two_days_before','day_before','hours_before')),
+  scheduled_at  TEXT NOT NULL,
+  sent_at       TEXT,
+  status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','failed','failed_permanent','cancelled')),
+  retry_count   INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  UNIQUE(booking_id, kind)
+);
+
+CREATE TABLE timerex_bookings (
+  id              TEXT PRIMARY KEY,
+  config_id       TEXT NOT NULL REFERENCES timerex_webhook_configs(id) ON DELETE CASCADE,
+  line_account_id TEXT NOT NULL REFERENCES line_accounts(id) ON DELETE CASCADE,
+  friend_id       TEXT REFERENCES friends(id) ON DELETE SET NULL,
+  external_id     TEXT NOT NULL,
+  event_type      TEXT,
+  status          TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked','cancelled','unknown')),
+  guest_name      TEXT,
+  guest_email     TEXT,
+  guest_phone     TEXT,
+  booking_code    TEXT,
+  starts_at       TEXT,
+  ends_at         TEXT,
+  meet_url        TEXT,
+  matched_by      TEXT,
+  raw_payload     TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  UNIQUE(config_id, external_id)
+);
+
+CREATE TABLE timerex_webhook_configs (
+  id                 TEXT PRIMARY KEY,
+  name               TEXT NOT NULL,
+  line_account_id    TEXT NOT NULL REFERENCES line_accounts(id) ON DELETE CASCADE,
+  notify_webhook_url TEXT,
+  is_active          INTEGER NOT NULL DEFAULT 1,
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
 CREATE TABLE tracked_links (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -851,6 +944,15 @@ CREATE INDEX idx_affiliate_links_affiliate ON affiliate_links (affiliate_id);
 CREATE INDEX idx_affiliate_links_offer ON affiliate_links (offer_id);
 
 CREATE UNIQUE INDEX idx_affiliates_friend ON affiliates (friend_id) WHERE friend_id IS NOT NULL;
+
+CREATE INDEX idx_ai_draft_logs_chat_created
+  ON ai_draft_logs (chat_id, created_at);
+
+CREATE INDEX idx_ai_knowledge_scope_active
+  ON ai_knowledge_items (knowledge_scope, is_active);
+
+CREATE INDEX idx_ai_reply_presets_active_order
+  ON ai_reply_presets (is_active, display_order);
 
 CREATE INDEX idx_auto_replies_template_id ON auto_replies(template_id);
 
@@ -999,6 +1101,21 @@ CREATE INDEX idx_stripe_events_friend ON stripe_events (friend_id);
 CREATE INDEX idx_stripe_events_type ON stripe_events (event_type);
 
 CREATE INDEX idx_templates_category ON templates (category);
+
+CREATE INDEX idx_timerex_booking_codes_friend
+  ON timerex_booking_codes(friend_id);
+
+CREATE INDEX idx_timerex_bookings_account_status_starts
+  ON timerex_bookings(line_account_id, status, starts_at);
+
+CREATE INDEX idx_timerex_bookings_friend_starts
+  ON timerex_bookings(friend_id, starts_at);
+
+CREATE INDEX idx_timerex_bookings_guest_email
+  ON timerex_bookings(guest_email);
+
+CREATE INDEX idx_timerex_reminders_status_scheduled
+  ON timerex_booking_reminders(status, scheduled_at);
 
 CREATE UNIQUE INDEX idx_tracked_links_short_code
   ON tracked_links (short_code) WHERE short_code IS NOT NULL;

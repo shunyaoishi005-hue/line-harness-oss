@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { verifySignature, LineClient } from '@line-crm/line-sdk';
-import type { WebhookRequestBody, WebhookEvent, TextEventMessage } from '@line-crm/line-sdk';
+import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message } from '@line-crm/line-sdk';
 import { createStickerMessageContent } from '@line-crm/shared';
 import {
   upsertFriend,
@@ -16,11 +16,16 @@ import {
 } from '@line-crm/db';
 import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
+import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { pushImmediateFirstStep } from '../services/immediate-first-step.js';
+import { fillTimerexBookingCodePlaceholder } from '../services/timerex-booking-codes.js';
+import { isTimerexRescheduleIntent } from '../services/timerex-intents.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
+const LINE_SPLIT_TOKEN = '{{line_split}}';
+const GENERIC_TIMEREX_BOOKING_KEYWORDS = new Set(['面談', '予約', '無料面談']);
 
 // LINE webhook bodies are small (events array). Cap defends against unauthenticated
 // large-payload DoS before signature verification (#104). 1 MiB leaves room for
@@ -247,6 +252,22 @@ async function handleEvent(
       const scenarioAccountMatch = !scenario.line_account_id || !lineAccountId || scenario.line_account_id === lineAccountId;
       if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
         try {
+          if (await shouldSkipCompletedInitialDiagnosis(db, friend.id, scenario)) {
+            console.log(`[follow] skip completed initial diagnosis friend=${friend.id} scenario=${scenario.id}`);
+            continue;
+          }
+
+          // LINE sends follow again when a user unblocks the account. Restart the
+          // friend_add scenario so real-device checks can begin from the first step.
+          await db
+            .prepare(
+              `UPDATE friend_scenarios
+               SET status = 'completed', updated_at = ?
+               WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`,
+            )
+            .bind(jstNow(), friend.id, scenario.id)
+            .run();
+
           // INSERT OR IGNORE handles dedup via UNIQUE(friend_id, scenario_id)
           const friendScenario = await enrollFriendInScenario(db, friend.id, scenario.id);
           if (!friendScenario) continue; // already enrolled
@@ -302,6 +323,15 @@ async function handleEvent(
       // above, and the intro push on this path uses pushMessage too.
       if (referralRoute.scenario_id) {
         try {
+          await db
+            .prepare(
+              `UPDATE friend_scenarios
+               SET status = 'completed', updated_at = ?
+               WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`,
+            )
+            .bind(jstNow(), friend.id, referralRoute.scenario_id)
+            .run();
+
           const enrollment = await enrollFriendInScenario(db, friend.id, referralRoute.scenario_id);
           console.log(`[follow] referral scenario enrolled scenario=${referralRoute.scenario_id}`);
           if (enrollment) {
@@ -389,21 +419,28 @@ async function handleEvent(
             response_type: rule.response_type,
             response_content: rule.response_content,
           });
-          const expandedContent = expandVariables(resolved.content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1], workerUrl, resolved.messageType);
-          const replyMsg = buildMessage(resolved.messageType, expandedContent);
-          await lineClient.replyMessage(event.replyToken, [replyMsg]);
+          const expandedContent = await fillTimerexBookingCodePlaceholder(
+            db,
+            expandVariables(resolved.content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1], workerUrl, resolved.messageType),
+            friend.id,
+            lineAccountId,
+          );
+          const replyMessages = buildAutoReplyMessages(resolved.messageType, expandedContent);
+          await lineClient.replyMessage(event.replyToken, replyMessages);
 
           // 送信ログ — Rich Menu 経由の Flex 応答もチャット詳細に残るようにする。
           // テキスト auto_reply (line ~390) と同じパターン。
           const { messageToLogPayload: logPayload } = await import('../services/step-delivery.js');
-          const replyPayload = logPayload(replyMsg);
-          await db
-            .prepare(
-              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, line_account_id, created_at)
-               VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'auto_reply', ?, ?)`,
-            )
-            .bind(crypto.randomUUID(), friend.id, replyPayload.messageType, replyPayload.content, lineAccountId ?? null, jstNow())
-            .run();
+          for (const replyMessage of replyMessages) {
+            const replyPayload = logPayload(replyMessage);
+            await db
+              .prepare(
+                `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, line_account_id, created_at)
+                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'auto_reply', ?, ?)`,
+              )
+              .bind(crypto.randomUUID(), friend.id, replyPayload.messageType, replyPayload.content, lineAccountId ?? null, jstNow())
+              .run();
+          }
         } catch (err) {
           console.error('Failed to send postback reply', err);
         }
@@ -584,6 +621,10 @@ async function handleEvent(
           ? incomingText === rule.keyword
           : incomingText.includes(rule.keyword);
 
+      if (isMatch && shouldSkipAutoReplyRuleForIncomingText(rule, incomingText)) {
+        continue;
+      }
+
       if (isMatch) {
         // silent タイプ: 返信しないが matched=true にして unread / push を抑止する
         if (rule.response_type === 'silent') {
@@ -599,24 +640,30 @@ async function handleEvent(
             response_type: rule.response_type,
             response_content: rule.response_content,
           });
-          const expandedContent = expandVariables(resolved.content, { ...friend, metadata: resolvedMeta2 } as Parameters<typeof expandVariables>[1], workerUrl, resolved.messageType);
-          const replyMsg = buildMessage(resolved.messageType, expandedContent);
-          await lineClient.replyMessage(event.replyToken, [replyMsg]);
+          const expandedContent = await fillTimerexBookingCodePlaceholder(
+            db,
+            expandVariables(resolved.content, { ...friend, metadata: resolvedMeta2 } as Parameters<typeof expandVariables>[1], workerUrl, resolved.messageType),
+            friend.id,
+            lineAccountId,
+          );
+          const replyMessages = buildAutoReplyMessages(resolved.messageType, expandedContent);
+          await lineClient.replyMessage(event.replyToken, replyMessages);
           replyTokenConsumed = true;
 
           // 送信ログ（replyMessage = 無料）— derive content from the built
           // reply message so any cleanEmptyNodes / parse-failure fallback is
           // reflected in the dashboard.
-          const outLogId = crypto.randomUUID();
           const { messageToLogPayload: logPayload2 } = await import('../services/step-delivery.js');
-          const wbAutoReplyPayload = logPayload2(replyMsg);
-          await db
-            .prepare(
-              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
-               VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'auto_reply', ?)`,
-            )
-            .bind(outLogId, friend.id, wbAutoReplyPayload.messageType, wbAutoReplyPayload.content, jstNow())
-            .run();
+          for (const replyMessage of replyMessages) {
+            const wbAutoReplyPayload = logPayload2(replyMessage);
+            await db
+              .prepare(
+                `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, line_account_id, created_at)
+                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'auto_reply', ?, ?)`,
+              )
+              .bind(crypto.randomUUID(), friend.id, wbAutoReplyPayload.messageType, wbAutoReplyPayload.content, lineAccountId ?? null, jstNow())
+              .run();
+          }
         } catch (err) {
           console.error('Failed to send auto-reply', err);
         }
@@ -659,6 +706,29 @@ async function resolveAutoReplyContent(
     }
   }
   return { messageType: rule.response_type, content: rule.response_content };
+}
+
+function shouldSkipAutoReplyRuleForIncomingText(
+  rule: { keyword: string; match_type: 'exact' | 'contains' },
+  incomingText: string,
+): boolean {
+  return (
+    rule.match_type === 'contains' &&
+    GENERIC_TIMEREX_BOOKING_KEYWORDS.has(rule.keyword) &&
+    isTimerexRescheduleIntent(incomingText)
+  );
+}
+
+function buildAutoReplyMessages(messageType: string, content: string): Message[] {
+  if (messageType !== 'text' || !content.includes(LINE_SPLIT_TOKEN)) {
+    return [buildMessage(messageType, content)];
+  }
+  return content
+    .split(LINE_SPLIT_TOKEN)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .map((part) => buildMessage('text', part));
 }
 
 export { webhook };

@@ -49,6 +49,10 @@ function serializeLineAccountFull(row: DbLineAccount) {
   };
 }
 
+function lineAccountScopeSql(column: string, includeLegacyNull: boolean): string {
+  return includeLegacyNull ? `(${column} = ? OR ${column} IS NULL)` : `${column} = ?`;
+}
+
 // Fetch bot profile (displayName, pictureUrl) from LINE API
 async function fetchBotProfile(accessToken: string): Promise<{ displayName?: string; pictureUrl?: string; basicId?: string }> {
   try {
@@ -68,17 +72,22 @@ lineAccounts.get('/api/line-accounts', async (c) => {
   try {
     const db = c.env.DB;
     const items = await getLineAccounts(db);
+    const includeLegacyNull = items.length === 1;
 
     // Get stats for all accounts in parallel
     const results = await Promise.all(
       items.map(async (item) => {
         const [profile, friendCount, scenarioCount, msgCount] = await Promise.all([
           fetchBotProfile(item.channel_access_token),
-          db.prepare(`SELECT COUNT(*) as count FROM friends WHERE is_following = 1 AND line_account_id = ?`).bind(item.id).first<{ count: number }>(),
+          db.prepare(
+            `SELECT COUNT(*) as count
+             FROM friends
+             WHERE is_following = 1 AND ${lineAccountScopeSql('line_account_id', includeLegacyNull)}`,
+          ).bind(item.id).first<{ count: number }>(),
           db.prepare(
             `SELECT COUNT(*) as count FROM friend_scenarios fs
              INNER JOIN friends f ON f.id = fs.friend_id
-             WHERE fs.status = 'active' AND f.line_account_id = ?`,
+             WHERE fs.status = 'active' AND ${lineAccountScopeSql('f.line_account_id', includeLegacyNull)}`,
           ).bind(item.id).first<{ count: number }>(),
           db.prepare(
             // 「今月送信」(messagesThisMonth) は LINE 公式ダッシュボードの「配信済みの無料メッセージ数」と
@@ -87,7 +96,7 @@ lineAccounts.get('/api/line-accounts', async (c) => {
             // 公式 dashboard と数桁ズレてた (例: 公式 10 通 vs UI 10,609 通) → start of month に揃えた。
             `SELECT COUNT(*) as count FROM messages_log ml
              INNER JOIN friends f ON f.id = ml.friend_id
-             WHERE ml.direction = 'outgoing' AND (ml.delivery_type IS NULL OR ml.delivery_type = 'push') AND ml.created_at >= date('now', 'start of month') AND f.line_account_id = ?`,
+             WHERE ml.direction = 'outgoing' AND (ml.delivery_type IS NULL OR ml.delivery_type = 'push') AND ml.created_at >= date('now', 'start of month') AND ${lineAccountScopeSql('f.line_account_id', includeLegacyNull)}`,
           ).bind(item.id).first<{ count: number }>(),
         ]);
 

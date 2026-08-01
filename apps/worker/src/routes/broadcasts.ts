@@ -50,6 +50,7 @@ function serializeBroadcast(row: DbBroadcast) {
     sentAt: row.sent_at,
     totalCount: row.total_count,
     successCount: row.success_count,
+    altText: r.alt_text || null,
     lineRequestId: r.line_request_id || null,
     aggregationUnit: r.aggregation_unit || null,
     lineAccountId: r.line_account_id || null,

@@ -278,7 +278,7 @@ export default function BroadcastDetail({ broadcastId }: BroadcastDetailProps) {
               tags={tags}
               accountId={accountId}
               onApply={async (conditions) => {
-                await api.broadcasts.update(id, { segmentConditions: JSON.stringify(conditions) } as unknown as Parameters<typeof api.broadcasts.update>[1])
+                await api.broadcasts.update(id, { segmentConditions: JSON.stringify(conditions) })
                 setShowSegmentBuilder(false)
                 load()
               }}

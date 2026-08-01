@@ -107,7 +107,8 @@ const CANDIDATES_SQL = `
     COALESCE(la.name, '(未分類)') AS account_name,
     agg.last_incoming,
     agg.last_manual,
-    agg.last_machine
+    agg.last_machine,
+    COALESCE(lc.status, 'unread') AS chat_status
   FROM friends f
   LEFT JOIN line_accounts la ON la.id = f.line_account_id
   JOIN agg ON agg.friend_id = f.id
@@ -207,6 +208,7 @@ interface RawCandidateRow {
   last_incoming: string;
   last_manual: string | null;
   last_machine: string | null;
+  chat_status?: string | null;
 }
 
 interface RawIncomingRow {
@@ -247,7 +249,9 @@ function applyFilters(rows: UnansweredRow[], opts: UnansweredInboxOptions): Unan
  */
 async function getAllUnansweredRows(db: D1Database): Promise<UnansweredRow[]> {
   const candidatesResult = await db.prepare(CANDIDATES_SQL).all<RawCandidateRow>();
-  const candidates = candidatesResult.results ?? [];
+  // Operator "resolved" is an explicit manual close. Honor it even when no
+  // source='manual' outgoing exists after the latest incoming.
+  const candidates = (candidatesResult.results ?? []).filter((c) => c.chat_status !== 'resolved');
   if (candidates.length === 0) return [];
 
   // 候補 friend のみを残すための Set。後段の JS group で他の friend は無視する。
