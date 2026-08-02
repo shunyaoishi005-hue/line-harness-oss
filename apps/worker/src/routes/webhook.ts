@@ -350,7 +350,21 @@ async function handleEvent(
     }
 
     // イベントバス発火: friend_add（replyToken は Step 0 で使用済みの可能性あり）
-    await fireEvent(db, 'friend_add', { friendId: friend.id, eventData: { displayName: friend.display_name } }, lineAccessToken, lineAccountId);
+    // conversionEventName を渡すと sendAdConversions が走り、広告クリックID
+    // (fbclid 等) が紐付いている友だちだけ各媒体の Conversion API へ Lead を
+    // 送る。LP側のブラウザピクセルはクリック時点でしか撃てないため、実際に
+    // 友だち追加まで到達した人だけを媒体に返せるのはこの経路だけ。
+    await fireEvent(
+      db,
+      'friend_add',
+      {
+        friendId: friend.id,
+        eventData: { displayName: friend.display_name },
+        conversionEventName: 'Lead',
+      },
+      lineAccessToken,
+      lineAccountId,
+    );
     return;
   }
 
