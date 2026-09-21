@@ -59,7 +59,9 @@
     "050_ai_reply_drafts.sql",
     "051_timerex_bookings.sql",
     "052_timerex_booking_codes.sql",
-    "053_timerex_reminders_two_days_before.sql"
+    "053_timerex_reminders_two_days_before.sql",
+    "054_ref_tracking_meta_browser_ids.sql",
+    "055_meta_lead_outbox.sql"
   ],
-  "migrationCount": 60
+  "migrationCount": 62
 }

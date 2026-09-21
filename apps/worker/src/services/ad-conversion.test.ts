@@ -16,6 +16,8 @@ function refTracking(overrides: Partial<RefTracking> = {}): RefTracking {
     entry_route_id: 'er_1',
     source_url: 'https://structure-partners.jp/',
     fbclid: 'IwAR_test_click_id',
+    fbc: null,
+    fbp: null,
     gclid: null,
     twclid: null,
     ttclid: null,
@@ -49,6 +51,22 @@ describe('buildMetaEventData', () => {
     const userData = data.user_data as Record<string, unknown>;
 
     expect(userData.fbc).toBe(`fb.1.${SEND_EPOCH_MS}.IwAR_test_click_id`);
+  });
+
+  it('prefers the browser-issued fbc and forwards fbp for stronger matching', () => {
+    const data = buildMetaEventData(
+      refTracking({
+        fbc: 'fb.1.1783642800000.browser_click_id',
+        fbp: 'fb.1.1783642799000.123456789',
+      }),
+      'Lead',
+      undefined,
+      SEND_EPOCH_MS,
+    );
+    const userData = data.user_data as Record<string, unknown>;
+
+    expect(userData.fbc).toBe('fb.1.1783642800000.browser_click_id');
+    expect(userData.fbp).toBe('fb.1.1783642799000.123456789');
   });
 
   it('derives a stable event_id so webhook redelivery is deduped', () => {

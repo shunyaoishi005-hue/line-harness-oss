@@ -17,6 +17,39 @@ import { calculateStaggerDelay, sleep, addMessageVariation } from './stealth.js'
 
 const MULTICAST_BATCH_SIZE = 500;
 
+async function assertNoExcludedTagRecipients(
+  db: D1Database,
+  friends: Array<{ id: string; line_user_id: string }>,
+  segmentConditionsStr: string | null,
+): Promise<void> {
+  if (!segmentConditionsStr || friends.length === 0) return;
+
+  const condition = JSON.parse(segmentConditionsStr) as {
+    rules?: Array<{ type?: string; value?: unknown }>;
+  };
+  const excludedTagIds = (condition.rules ?? [])
+    .filter((rule) => rule.type === 'tag_not_exists' && typeof rule.value === 'string')
+    .map((rule) => rule.value as string);
+  if (excludedTagIds.length === 0) return;
+
+  // Validate the final recipient IDs independently of the segment builder. This
+  // is the last safety gate before a LINE multicast is made.
+  for (let offset = 0; offset < friends.length; offset += MULTICAST_BATCH_SIZE) {
+    const friendIds = friends.slice(offset, offset + MULTICAST_BATCH_SIZE).map((friend) => friend.id);
+    const friendPlaceholders = friendIds.map(() => '?').join(', ');
+    const tagPlaceholders = excludedTagIds.map(() => '?').join(', ');
+    const result = await db.prepare(
+      `SELECT DISTINCT f.id
+         FROM friends f
+         INNER JOIN friend_tags ft ON ft.friend_id = f.id
+        WHERE f.id IN (${friendPlaceholders}) AND ft.tag_id IN (${tagPlaceholders})`,
+    ).bind(...friendIds, ...excludedTagIds).all<{ id: string }>();
+
+    if ((result.results ?? []).length > 0) {
+      throw new Error(`Segment safety check blocked ${result.results!.length} recipient(s) with excluded tags`);
+    }
+  }
+}
 export async function processBroadcastSend(
   db: D1Database,
   lineClient: LineClient,
@@ -29,6 +62,14 @@ export async function processBroadcastSend(
   const broadcast = await getBroadcastById(db, broadcastId);
   if (!broadcast) {
     throw new Error(`Broadcast ${broadcastId} not found`);
+  }
+
+  // A broadcast with segment conditions must never enter the all/tag inline
+  // sender. Callers must queue it, otherwise an accidental full broadcast can
+  // occur when a condition is ignored.
+  const rawBroadcast = broadcast as unknown as Record<string, unknown>;
+  if (rawBroadcast.segment_conditions) {
+    throw new Error('Segment broadcast must be processed by the queued sender');
   }
 
   // multi-account-dedup は inline 送信せず cron queue (processQueuedBroadcasts) に委譲する。
@@ -194,7 +235,15 @@ export async function processScheduledBroadcasts(
         }
       }
 
-      await processBroadcastSend(db, deliveryClient, broadcast.id, workerUrl);
+      // Segment broadcasts must use the queued executor so their conditions are
+      // evaluated at the scheduled delivery time. The inline sender only handles
+      // all/tag targets and would otherwise mark a scheduled segment as sent.
+      const rawBroadcast = broadcast as unknown as Record<string, unknown>;
+      if (rawBroadcast.segment_conditions) {
+        await processQueuedBroadcastBatches(db, deliveryClient, broadcast, workerUrl);
+      } else {
+        await processBroadcastSend(db, deliveryClient, broadcast.id, workerUrl);
+      }
     } catch (err) {
       console.error(`Failed to send scheduled broadcast ${broadcast.id}:`, err);
       // Reset to scheduled so it can be retried next cron
@@ -354,6 +403,15 @@ async function processQueuedBroadcastBatches(
     await createBroadcastInsight(db, broadcast.id);
     await updateBroadcastStatus(db, broadcast.id, 'sent', { totalCount: 0, successCount: 0 });
     return;
+  }
+
+  // The SQL used to select recipients and the final tag guard are deliberately
+  // separate. If they ever disagree, fail closed before LINE receives a call.
+  try {
+    await assertNoExcludedTagRecipients(db, friends, segmentConditionsStr);
+  } catch (err) {
+    await updateBroadcastStatus(db, broadcast.id, 'draft');
+    throw err;
   }
 
   // 初回: total_count を設定

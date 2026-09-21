@@ -21,6 +21,8 @@ export interface RefTracking {
   entry_route_id: string | null;
   source_url: string | null;
   fbclid: string | null;
+  fbc: string | null;
+  fbp: string | null;
   gclid: string | null;
   twclid: string | null;
   ttclid: string | null;
@@ -225,6 +227,8 @@ export async function recordRefTracking(
     entryRouteId?: string | null;
     sourceUrl?: string | null;
     fbclid?: string | null;
+    fbc?: string | null;
+    fbp?: string | null;
     gclid?: string | null;
     twclid?: string | null;
     ttclid?: string | null;
@@ -242,9 +246,9 @@ export async function recordRefTracking(
     .prepare(
       `INSERT INTO ref_tracking
        (id, ref_code, friend_id, entry_route_id, source_url,
-        fbclid, gclid, twclid, ttclid, utm_source, utm_medium, utm_campaign,
+        fbclid, fbc, fbp, gclid, twclid, ttclid, utm_source, utm_medium, utm_campaign,
         user_agent, ip_address, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -253,6 +257,8 @@ export async function recordRefTracking(
       opts.entryRouteId ?? null,
       opts.sourceUrl ?? null,
       opts.fbclid ?? null,
+      opts.fbc ?? null,
+      opts.fbp ?? null,
       opts.gclid ?? null,
       opts.twclid ?? null,
       opts.ttclid ?? null,
@@ -287,6 +293,8 @@ export async function attachRefTrackingToFriend(
     entryRouteId?: string | null;
     sourceUrl?: string | null;
     fbclid?: string | null;
+    fbc?: string | null;
+    fbp?: string | null;
     gclid?: string | null;
     twclid?: string | null;
     ttclid?: string | null;
@@ -304,6 +312,8 @@ export async function attachRefTrackingToFriend(
            entry_route_id = COALESCE(entry_route_id, ?),
            source_url = COALESCE(source_url, ?),
            fbclid = COALESCE(fbclid, ?),
+           fbc = COALESCE(fbc, ?),
+           fbp = COALESCE(fbp, ?),
            gclid = COALESCE(gclid, ?),
            twclid = COALESCE(twclid, ?),
            ttclid = COALESCE(ttclid, ?),
@@ -319,6 +329,8 @@ export async function attachRefTrackingToFriend(
       opts.entryRouteId ?? null,
       opts.sourceUrl ?? null,
       opts.fbclid ?? null,
+      opts.fbc ?? null,
+      opts.fbp ?? null,
       opts.gclid ?? null,
       opts.twclid ?? null,
       opts.ttclid ?? null,
@@ -348,7 +360,7 @@ export async function getRefTrackingWithClickIds(
     .prepare(
       `SELECT * FROM ref_tracking
        WHERE friend_id = ?
-       AND (fbclid IS NOT NULL OR gclid IS NOT NULL OR twclid IS NOT NULL OR ttclid IS NOT NULL)
+       AND (fbclid IS NOT NULL OR fbc IS NOT NULL OR gclid IS NOT NULL OR twclid IS NOT NULL OR ttclid IS NOT NULL)
        ORDER BY created_at DESC
        LIMIT 1`,
     )

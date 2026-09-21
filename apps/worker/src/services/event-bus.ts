@@ -33,6 +33,7 @@ export interface EventPayload {
   friendId?: string;
   eventData?: Record<string, unknown>;
   conversionEventName?: string;
+  conversionEventTimeMs?: number;
   conversionValue?: number;
   replyToken?: string;
 }
@@ -60,7 +61,7 @@ export async function fireEvent(
   ];
   if (payload.friendId && payload.conversionEventName) {
     phase1.push(
-      sendAdConversions(db, payload.friendId, payload.conversionEventName, payload.conversionValue),
+      sendAdConversions(db, payload.friendId, payload.conversionEventName, payload.conversionValue, payload.conversionEventTimeMs),
     );
   }
   await Promise.allSettled(phase1);

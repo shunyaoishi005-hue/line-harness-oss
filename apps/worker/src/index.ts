@@ -14,6 +14,7 @@ import {
   incrementAffiliateLinkClick,
 } from '@line-crm/db';
 import { processStepDeliveries } from './services/step-delivery.js';
+import { processMetaLeadOutbox } from './services/meta-lead-outbox.js';
 import { processScheduledBroadcasts, processQueuedBroadcasts } from './services/broadcast.js';
 import { processReminderDeliveries } from './services/reminder-delivery.js';
 import { checkAccountHealth } from './services/ban-monitor.js';
@@ -271,6 +272,8 @@ app.get('/r/:ref', async (c) => {
         entryRouteId: route.id,
         sourceUrl: c.req.header('Referer') || c.req.url,
         fbclid: c.req.query('fbclid') || null,
+        fbc: c.req.query('fbc') || null,
+        fbp: c.req.query('fbp') || null,
         gclid: c.req.query('gclid') || null,
         twclid: c.req.query('twclid') || null,
         ttclid: c.req.query('ttclid') || null,
@@ -354,6 +357,8 @@ app.get('/r/:ref', async (c) => {
   if (xh) liffParams.set('xh', xh);
   const ig = c.req.query('ig');
   if (ig) liffParams.set('ig', ig);
+  // fbc / fbp はMeta専用のブラウザ識別子なので、LINEのLIFF URLへは渡さない。
+  // /r で保存したref_tracking行をrtだけで引き継ぎ、CAPI送信時にWorker内で参照する。
   for (const key of ['gclid', 'fbclid', 'twclid', 'ttclid', 'utm_source', 'utm_medium', 'utm_campaign']) {
     const value = c.req.query(key);
     if (value) liffParams.set(key, value);
@@ -957,6 +962,7 @@ async function scheduled(
   );
   jobs.push(processQueuedBroadcasts(env.DB, defaultLineClient, env.WORKER_URL));
   jobs.push(checkAccountHealth(env.DB));
+  jobs.push(processMetaLeadOutbox(env.DB).catch(() => console.error('[meta-lead] outbox_drain_failed')));
 
   await Promise.allSettled(jobs);
 

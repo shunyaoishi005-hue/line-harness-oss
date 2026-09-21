@@ -36,6 +36,24 @@ function parseJsonArray(s: unknown): string[] | null {
   }
 }
 
+function parseSegmentConditions(value: unknown): SegmentCondition | null {
+  if (value === null || value === undefined || value === '') return null;
+
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    !('operator' in parsed) ||
+    !('rules' in parsed) ||
+    ((parsed as SegmentCondition).operator !== 'AND' && (parsed as SegmentCondition).operator !== 'OR') ||
+    !Array.isArray((parsed as SegmentCondition).rules)
+  ) {
+    throw new Error('segmentConditions must include an AND/OR operator and rules array');
+  }
+
+  return parsed as SegmentCondition;
+}
+
 function serializeBroadcast(row: DbBroadcast) {
   const r = row as unknown as Record<string, unknown>;
   return {
@@ -57,6 +75,7 @@ function serializeBroadcast(row: DbBroadcast) {
     accountIds: parseJsonArray(r.account_ids),
     dedupPriority: parseJsonArray(r.dedup_priority),
     failedAccountIds: parseJsonArray(r.failed_account_ids),
+    segmentConditions: r.segment_conditions || null,
     // 046 以前の行/未マイグレーション環境では undefined → 従来挙動 (ON) 扱い
     trackLinks: row.track_links === undefined ? true : row.track_links !== 0,
     createdAt: row.created_at,
@@ -140,6 +159,18 @@ broadcasts.get('/api/broadcasts/:id/preview-count', async (c) => {
            INNER JOIN friend_tags ft ON ft.friend_id = f.id
            WHERE ft.tag_id = ? AND f.is_following = 1`,
       ).bind(broadcast.target_tag_id).first<{ cnt: number }>();
+      count = row?.cnt ?? 0;
+    } else if ((raw.segment_conditions as string | null)) {
+      const condition = parseSegmentConditions(raw.segment_conditions);
+      const { buildSegmentQuery } = await import('../services/segment-query.js');
+      const { sql, bindings } = buildSegmentQuery(condition!);
+      const accountId = (raw.line_account_id as string | null) || null;
+      const accountSql = accountId
+        ? sql.replace('WHERE', 'WHERE f.line_account_id = ? AND')
+        : sql;
+      const accountBindings = accountId ? [accountId, ...bindings] : bindings;
+      const countSql = accountSql.replace(/^SELECT f\.id, f\.line_user_id FROM/, 'SELECT COUNT(*) AS cnt FROM');
+      const row = await c.env.DB.prepare(countSql).bind(...accountBindings).first<{ cnt: number }>();
       count = row?.cnt ?? 0;
     } else if (broadcast.target_type === 'all') {
       const accountId = (raw.line_account_id as string | null) || null;
@@ -274,6 +305,7 @@ broadcasts.post('/api/broadcasts', async (c) => {
       accountIds?: string[];
       dedupPriority?: string[];
       trackLinks?: boolean;
+      segmentConditions?: string | null;
     }>();
 
     if (!body.title || !body.messageType || !body.messageContent || !body.targetType) {
@@ -314,11 +346,17 @@ broadcasts.post('/api/broadcasts', async (c) => {
       trackLinks: body.trackLinks,
     });
 
-    // Save line_account_id and alt_text if provided
+    const segmentConditions = parseSegmentConditions(body.segmentConditions);
+
+    // Save optional columns that are not part of the DB helper
     const updates: string[] = [];
     const binds: unknown[] = [];
     if (body.lineAccountId) { updates.push('line_account_id = ?'); binds.push(body.lineAccountId); }
     if (body.altText) { updates.push('alt_text = ?'); binds.push(body.altText); }
+    if (body.segmentConditions !== undefined) {
+      updates.push('segment_conditions = ?');
+      binds.push(segmentConditions ? JSON.stringify(segmentConditions) : null);
+    }
     if (updates.length > 0) {
       binds.push(broadcast.id);
       await c.env.DB.prepare(`UPDATE broadcasts SET ${updates.join(', ')} WHERE id = ?`)
@@ -354,6 +392,7 @@ broadcasts.put('/api/broadcasts/:id', async (c) => {
       targetTagId?: string | null;
       scheduledAt?: string | null;
       trackLinks?: boolean;
+      segmentConditions?: string | null;
     }>();
 
     // Keep status in sync with scheduledAt changes
@@ -372,6 +411,12 @@ broadcasts.put('/api/broadcasts/:id', async (c) => {
       ...(body.trackLinks !== undefined ? { track_links: body.trackLinks ? 1 : 0 } : {}),
       ...(statusUpdate !== undefined ? { status: statusUpdate } : {}),
     });
+
+    if (body.segmentConditions !== undefined) {
+      const segmentConditions = parseSegmentConditions(body.segmentConditions);
+      await c.env.DB.prepare('UPDATE broadcasts SET segment_conditions = ? WHERE id = ?')
+        .bind(segmentConditions ? JSON.stringify(segmentConditions) : null, id).run();
+    }
 
     // 失敗 partial dedup broadcast を draft に戻して編集 → 再送するケースで、
     // 残っていた resume 用 state を全部クリアして fresh campaign として送り直せる
@@ -437,6 +482,39 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
     if (!existing) {
       return c.json({ success: false, error: 'Broadcast not found' }, 404);
     }
+    const rawExisting = existing as unknown as Record<string, unknown>;
+
+    // A saved segment condition is authoritative, even when the legacy
+    // target_type is "all". Always queue it; the inline all-sender must never
+    // be allowed to bypass the condition.
+    if (rawExisting.segment_conditions) {
+      const lockResult = await c.env.DB.prepare(
+        `UPDATE broadcasts SET status = 'sending', batch_offset = 0 WHERE id = ? AND status IN ('draft','scheduled')`,
+      ).bind(id).run();
+      if (!lockResult.meta.changes) {
+        return c.json({ success: false, error: 'Broadcast is already sent or sending' }, 409);
+      }
+
+      try {
+        const ctx = c.executionCtx as ExecutionContext;
+        const defaultClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
+        ctx.waitUntil(
+          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL).catch((err) => {
+            console.error('[segment] background queue processing failed:', err);
+          }),
+        );
+      } catch (kickErr) {
+        console.warn('[segment] waitUntil unavailable, falling back to cron:', kickErr);
+      }
+
+      const result = await getBroadcastById(c.env.DB, id);
+      return c.json({
+        success: true,
+        data: result ? serializeBroadcast(result) : null,
+        queued: true,
+        message: 'Segment broadcast queued for condition-safe processing',
+      }, 202);
+    }
 
     // multi-account-dedup は常にキュー方式 — Worker の30秒制限を超えるため
     if (existing.target_type === 'multi-account-dedup') {
@@ -447,7 +525,6 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
       //
       // total_count を同期計算して書く: progress polling が 0/0 のまま固まらないように。
       // computeDedupBroadcastPreview は単一SQL (ROW_NUMBER OVER) なので軽量。
-      const rawExisting = existing as unknown as Record<string, unknown>;
       const accountIds = parseJsonArray(rawExisting.account_ids) ?? [];
       const dedupPriority = parseJsonArray(rawExisting.dedup_priority) ?? [];
       const preview = await computeDedupBroadcastPreview(
@@ -582,6 +659,39 @@ broadcasts.post('/api/broadcasts/:id/send-segment', async (c) => {
 
     if (!existing) {
       return c.json({ success: false, error: 'Broadcast not found' }, 404);
+    }
+    const rawExisting = existing as unknown as Record<string, unknown>;
+
+    // A saved segment condition is authoritative, even when the legacy
+    // target_type is "all". Always queue it; the inline all-sender must never
+    // be allowed to bypass the condition.
+    if (rawExisting.segment_conditions) {
+      const lockResult = await c.env.DB.prepare(
+        `UPDATE broadcasts SET status = 'sending', batch_offset = 0 WHERE id = ? AND status IN ('draft','scheduled')`,
+      ).bind(id).run();
+      if (!lockResult.meta.changes) {
+        return c.json({ success: false, error: 'Broadcast is already sent or sending' }, 409);
+      }
+
+      try {
+        const ctx = c.executionCtx as ExecutionContext;
+        const defaultClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
+        ctx.waitUntil(
+          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL).catch((err) => {
+            console.error('[segment] background queue processing failed:', err);
+          }),
+        );
+      } catch (kickErr) {
+        console.warn('[segment] waitUntil unavailable, falling back to cron:', kickErr);
+      }
+
+      const result = await getBroadcastById(c.env.DB, id);
+      return c.json({
+        success: true,
+        data: result ? serializeBroadcast(result) : null,
+        queued: true,
+        message: 'Segment broadcast queued for condition-safe processing',
+      }, 202);
     }
 
     const body = await c.req.json<{ conditions: SegmentCondition }>();
@@ -914,7 +1024,7 @@ broadcasts.post('/api/segments/count', async (c) => {
       accountBindings.unshift(body.accountId);
     }
 
-    const countSql = accountSql.replace(/^SELECT .+ FROM/, 'SELECT COUNT(*) as count FROM');
+    const countSql = accountSql.replace(/^SELECT f\.id, f\.line_user_id FROM/, 'SELECT COUNT(*) as count FROM');
     const result = await c.env.DB.prepare(countSql).bind(...accountBindings).first<{ count: number }>();
 
     return c.json({ success: true, count: result?.count ?? 0 });

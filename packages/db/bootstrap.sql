@@ -587,6 +587,24 @@ CREATE TABLE messages_log (
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE meta_lead_outbox (
+ id TEXT PRIMARY KEY,
+ friend_id TEXT NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
+ ad_platform_id TEXT NOT NULL REFERENCES ad_platforms(id) ON DELETE CASCADE,
+ pixel_id TEXT NOT NULL,
+ event_time INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','sent','expired')),
+ attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at INTEGER NOT NULL,
+ lease_token TEXT,
+ payload TEXT,
+ last_error TEXT,
+ response_summary TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ UNIQUE(friend_id, ad_platform_id)
+);
+
 CREATE TABLE notification_rules (
   id           TEXT PRIMARY KEY,
   name         TEXT NOT NULL,
@@ -647,7 +665,7 @@ CREATE TABLE ref_tracking (
   entry_route_id  TEXT REFERENCES entry_routes (id) ON DELETE SET NULL,
   source_url      TEXT,
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
-, fbclid TEXT, gclid TEXT, twclid TEXT, ttclid TEXT, utm_source TEXT, utm_medium TEXT, utm_campaign TEXT, user_agent TEXT, ip_address TEXT);
+, fbclid TEXT, gclid TEXT, twclid TEXT, ttclid TEXT, utm_source TEXT, utm_medium TEXT, utm_campaign TEXT, user_agent TEXT, ip_address TEXT, fbc TEXT, fbp TEXT);
 
 CREATE TABLE reminder_steps (
   id              TEXT PRIMARY KEY,
@@ -1063,6 +1081,8 @@ CREATE INDEX idx_messages_log_friend_direction_created ON messages_log (friend_i
 CREATE INDEX idx_messages_log_friend_id ON messages_log (friend_id);
 
 CREATE INDEX idx_messages_log_friend_source ON messages_log (friend_id, source);
+
+CREATE INDEX idx_meta_lead_outbox_due ON meta_lead_outbox(status, next_attempt_at);
 
 CREATE INDEX idx_notifications_created ON notifications (created_at);
 

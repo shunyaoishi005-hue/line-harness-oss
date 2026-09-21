@@ -16,6 +16,7 @@ import {
 } from '@line-crm/db';
 import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
+import { enqueueMetaLead } from '../services/meta-lead-outbox.js';
 import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { pushImmediateFirstStep } from '../services/immediate-first-step.js';
@@ -219,6 +220,14 @@ async function handleEvent(
       console.log(`[follow] line_account_id set to ${lineAccountId} for friend ${friend.id}`);
     }
 
+    // Persist before the parallel OAuth callback or slow scenario delivery can race us.
+    // The event-bus path retries enqueue if a transient DB error occurs here.
+    try {
+      await enqueueMetaLead(db, friend.id, event.timestamp);
+    } catch {
+      console.error('[meta-lead] follow_enqueue_failed');
+    }
+
     // Resolve referral link (entry_route) for this friend.
     // /auth/callback (OAuth path) writes friends.ref_code in parallel with
     // this follow webhook, so the field can briefly be NULL when LINE
@@ -361,6 +370,7 @@ async function handleEvent(
         friendId: friend.id,
         eventData: { displayName: friend.display_name },
         conversionEventName: 'Lead',
+        conversionEventTimeMs: event.timestamp,
       },
       lineAccessToken,
       lineAccountId,

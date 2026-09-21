@@ -12,13 +12,21 @@ import {
   type AdPlatformConfig,
   type RefTracking,
 } from '@line-crm/db';
+import { buildMetaEventData, postMetaEvent } from './meta-capi.js';
+import { enqueueMetaLead, processMetaLeadOutbox } from './meta-lead-outbox.js';
+export { buildMetaEventData } from './meta-capi.js';
 
 export async function sendAdConversions(
   db: D1Database,
   friendId: string,
   eventName: string,
   eventValue?: number,
+  eventTimeMs: number = Date.now(),
 ): Promise<void> {
+  if (eventName === 'Lead') {
+    await enqueueMetaLead(db, friendId, eventTimeMs);
+    await processMetaLeadOutbox(db, { friendId });
+  }
   const ref = await getRefTrackingWithClickIds(db, friendId);
   if (!ref) return;
 
@@ -30,11 +38,11 @@ export async function sendAdConversions(
     try {
       switch (platform.name) {
         case 'meta':
-          if (ref.fbclid) {
-            await sendMetaConversion(config, ref, eventName, eventValue);
+          if (eventName !== 'Lead' && (ref.fbclid || ref.fbc)) {
+            await postMetaEvent(config, buildMetaEventData(ref, eventName, eventValue, eventTimeMs));
             await logAdConversion(db, {
               platformId: platform.id, friendId, eventName,
-              clickId: ref.fbclid, clickIdType: 'fbclid', status: 'sent',
+              clickId: ref.fbclid || ref.fbc || '', clickIdType: 'fbclid', status: 'sent',
             });
           }
           break;
@@ -77,83 +85,6 @@ export async function sendAdConversions(
         errorMessage: String(error),
       });
     }
-  }
-}
-
-/**
- * Meta Conversions API の1イベント分のペイロードを組み立てる。
- *
- * 送信そのものから切り出してあるのは、fbc のタイムスタンプ・重複排除キー・
- * action_source の3点が仕様上の落とし穴で、テストで固定したいため。
- */
-export function buildMetaEventData(
-  ref: RefTracking,
-  eventName: string,
-  eventValue?: number,
-  now: number = Date.now(),
-): Record<string, unknown> {
-  // fbc の第3要素は「fbclid を受け取った時刻」であって送信時刻ではない。
-  // 広告クリックから LINE 友だち追加までは数分〜数日空くため、ここを
-  // 送信時刻にすると Meta 側のアトリビューション精度が落ちる。
-  // ref_tracking.created_at は JST オフセット付き ISO8601 (jstNow)。
-  const clickTime = Date.parse(ref.created_at);
-  const fbcTimestamp = Number.isNaN(clickTime) ? now : clickTime;
-
-  const eventData: Record<string, unknown> = {
-    event_name: eventName,
-    event_time: Math.floor(now / 1000),
-    // 同じ友だちの同じイベントは Meta 側で1件に畳む。LINE の webhook
-    // 再配信やブロック解除後の再 follow による二重計上を防ぐ。
-    event_id: `${eventName}:${ref.friend_id ?? ref.id}`,
-    // action_source: 'website' は event_source_url が必須。取れていない
-    // ときは 'other'（LINE アプリ内での発生）として送る。
-    action_source: ref.source_url ? 'website' : 'other',
-    user_data: {
-      fbc: `fb.1.${fbcTimestamp}.${ref.fbclid}`,
-      client_ip_address: ref.ip_address || undefined,
-      client_user_agent: ref.user_agent || undefined,
-    },
-  };
-
-  if (ref.source_url) {
-    eventData.event_source_url = ref.source_url;
-  }
-
-  if (eventValue) {
-    eventData.custom_data = { currency: 'JPY', value: eventValue };
-  }
-
-  return eventData;
-}
-
-async function sendMetaConversion(
-  config: AdPlatformConfig,
-  ref: RefTracking,
-  eventName: string,
-  eventValue?: number,
-): Promise<void> {
-  const url = `https://graph.facebook.com/v21.0/${config.pixel_id}/events`;
-
-  const eventData = buildMetaEventData(ref, eventName, eventValue);
-
-  const body: Record<string, unknown> = {
-    data: [eventData],
-    access_token: config.access_token,
-  };
-
-  if (config.test_event_code) {
-    body.test_event_code = config.test_event_code;
-  }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Meta CAPI error: ${response.status} ${errorBody}`);
   }
 }
 

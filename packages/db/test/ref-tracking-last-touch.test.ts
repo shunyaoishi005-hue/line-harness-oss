@@ -143,4 +143,23 @@ describe('recordRefTracking: last-touch update', () => {
     expect(after.last_ref_code).toBe(before.last_ref_code);
     expect(after.last_ref_at).toBe(before.last_ref_at);
   });
+
+  test('Meta browser identifiers are preserved on the anonymous LP click', async () => {
+    await recordRefTracking(db, {
+      refCode: 'ref_lp',
+      fbclid: 'IwAR_test_click_id',
+      fbc: 'fb.1.1783642800000.IwAR_test_click_id',
+      fbp: 'fb.1.1783642799000.123456789',
+    });
+
+    const row = sqlite
+      .prepare(`SELECT fbclid, fbc, fbp FROM ref_tracking WHERE ref_code = 'ref_lp'`)
+      .get() as { fbclid: string | null; fbc: string | null; fbp: string | null };
+
+    expect(row).toEqual({
+      fbclid: 'IwAR_test_click_id',
+      fbc: 'fb.1.1783642800000.IwAR_test_click_id',
+      fbp: 'fb.1.1783642799000.123456789',
+    });
+  });
 });
