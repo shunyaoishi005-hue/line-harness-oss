@@ -163,24 +163,26 @@ export default function BroadcastForm({ tags, onSuccess, onCancel }: BroadcastFo
                 {form.altText.length}/400
               </span>
             </div>
-            <input
+            <Input
               type="text"
+              aria-label="代替テキスト（LINE一覧・通知に表示）"
               maxLength={400}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+              className="w-full"
               placeholder="例: 大阪・兵庫・京都の注目案件が動いています"
               value={form.altText}
               onChange={(e) => setForm({ ...form, altText: e.target.value })}
             />
             <div className="flex flex-wrap gap-2 mt-2">
               {flexAltTextSuggestions.map((text) => (
-                <button
+                <Button
                   key={text}
                   type="button"
+                  size="xs"
+                  variant="outline"
                   onClick={() => setForm({ ...form, altText: text })}
-                  className="px-2.5 py-1.5 text-[11px] font-medium rounded-md border border-gray-300 text-gray-600 bg-white hover:border-green-400 hover:text-green-700 transition-colors"
                 >
                   {text}
-                </button>
+                </Button>
               ))}
             </div>
             <p className="text-xs text-gray-500 mt-1">
