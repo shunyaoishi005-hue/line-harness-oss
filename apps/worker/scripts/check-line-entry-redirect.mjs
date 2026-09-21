@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_URL = process.env.LINE_ENTRY_SMOKE_URL || 'https://your-worker.example.workers.dev/r/ref_lp';

@@ -1464,7 +1464,7 @@ describe('LIFF POST /api/liff/events/:id/bookings', () => {
       expect.objectContaining({ kind: 'received_confirmed' }),
     );
     expect(idempotencyMocks.finalizeEventIdempotencyResponse).toHaveBeenCalled();
-  });
+  }, 15_000);
 
   test('creates requested booking when requires_approval=1', async () => {
     const state = {

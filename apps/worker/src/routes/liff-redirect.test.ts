@@ -43,6 +43,7 @@ const baseEnv: Env['Bindings'] = {
   LINE_LOGIN_CHANNEL_ID: '2000000002',
   LINE_LOGIN_CHANNEL_SECRET: 'test-login-secret',
   WORKER_URL: 'https://worker.example.com',
+  TENANT_SCHEDULER: {} as Env['Bindings']['TENANT_SCHEDULER'],
 };
 
 function setupApp(envOverrides: Partial<Env['Bindings']> = {}) {

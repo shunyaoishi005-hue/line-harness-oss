@@ -43,7 +43,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   sqlite = new DatabaseSync(':memory:');
   sqlite.exec(readFileSync(new URL('../../../../packages/db/bootstrap.sql', import.meta.url), 'utf8'));
-  sqlite.exec(readFileSync(new URL('../../../../packages/db/migrations/055_meta_lead_outbox.sql', import.meta.url), 'utf8'));
+  sqlite.exec(readFileSync(new URL('../../../../packages/db/migrations/074_meta_lead_outbox.sql', import.meta.url), 'utf8'));
   sqlite.prepare("INSERT INTO friends (id,line_user_id,display_name) VALUES ('friend-1','line-test-1','Test')").run();
   sqlite.prepare("INSERT INTO ad_platforms (id,name,config,is_active) VALUES ('meta-1','meta',?,1)").run(JSON.stringify(config));
   db=wrapDb(sqlite);
@@ -176,7 +176,7 @@ describe('durable Meta Lead delivery', () => {
   });
   it('migration is rerunnable without losing a pending registration', async () => {
     await enqueueMetaLead(db,'friend-1',FOLLOW);
-    sqlite.exec(readFileSync(new URL('../../../../packages/db/migrations/055_meta_lead_outbox.sql', import.meta.url),'utf8'));
+    sqlite.exec(readFileSync(new URL('../../../../packages/db/migrations/074_meta_lead_outbox.sql', import.meta.url),'utf8'));
     expect(row().event_time).toBe(FOLLOW/1000);
   });
   it('does not enqueue anything merely by visiting the LP (no follow)', async () => {
