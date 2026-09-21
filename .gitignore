@@ -13,6 +13,9 @@ dist-mcp/
 *.toml.bak
 .env.production
 .env.staging
+# Wrangler local secrets — matches apps/worker/.dev.vars and any other worker's copy at any depth
+.dev.vars
+.dev.vars.*
 apps/web/out/
 apps/worker/dist/
 .worktrees/
@@ -24,3 +27,6 @@ apps/worker/dist/
 .codex_tmp/
 scenario_flex.json
 auto_reply_flex.json
+
+# Claude Code local dev-server config (machine-local paths)
+.claude/launch.json

@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import { API_KEY_STORAGE_KEY, CSRF_STORAGE_KEY } from '@/lib/api'
+import { getApiBase } from '@/lib/api-base'
 
 export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -21,7 +22,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     // fallback using the API key entered on the login screen.
     const checkSession = async () => {
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL
+        const apiUrl = getApiBase()
         const apiKey = localStorage.getItem(API_KEY_STORAGE_KEY)
         const res = await fetch(`${apiUrl}/api/auth/session`, {
           credentials: 'include',

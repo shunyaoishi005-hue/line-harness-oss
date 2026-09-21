@@ -42,7 +42,7 @@ function applyMigrationReplay(db: Database.Database): void {
 }
 
 function readSchemaObjects(db: Database.Database) {
-  return db
+  const objects = db
     .prepare(
       `
         SELECT type, name, sql
@@ -61,6 +61,9 @@ function readSchemaObjects(db: Database.Database) {
       `,
     )
     .all() as Array<{ type: string; name: string; sql: string }>;
+  // SQLite preserves the source line endings in sqlite_master. Normalize them
+  // so a Windows checkout does not look like a schema mismatch.
+  return objects.map((object) => ({ ...object, sql: object.sql.replace(/\r\n/g, '\n') }));
 }
 
 describe('bootstrap.sql', () => {
@@ -81,5 +84,34 @@ describe('bootstrap.sql', () => {
     applyMigrationReplay(replayDb);
 
     expect(readSchemaObjects(bootstrapDb)).toEqual(readSchemaObjects(replayDb));
+  });
+
+  it('includes built-in auto-reply seed data for clean installs', () => {
+    const db = new Database(':memory:');
+    db.exec(readFileSync(BOOTSTRAP_PATH, 'utf8'));
+
+    const rule = db
+      .prepare(
+        `SELECT keyword, match_type, response_type, line_account_id, is_active, response_content
+           FROM auto_replies
+          WHERE id = 'builtin-mileage-wallet-keyword'`,
+      )
+      .get() as {
+        keyword: string;
+        match_type: string;
+        response_type: string;
+        line_account_id: string | null;
+        is_active: number;
+        response_content: string;
+      } | undefined;
+
+    expect(rule).toMatchObject({
+      keyword: 'マイル',
+      match_type: 'exact',
+      response_type: 'flex',
+      line_account_id: null,
+      is_active: 1,
+    });
+    expect(rule?.response_content).toContain('?page=affiliate&liffId={{liff_id}}');
   });
 });

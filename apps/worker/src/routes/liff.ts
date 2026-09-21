@@ -1,6 +1,8 @@
 import { Hono, type Context } from 'hono';
+import { createLiffQueryReader } from '../lib/liff-query.js';
 import {
   getFriendByLineUserId,
+  getFriendByLineUserIdForAccount,
   createUser,
   getUserByEmail,
   linkFriendToUser,
@@ -21,15 +23,35 @@ import {
   getAffiliateLinkByRefCode,
   getAffiliateOfferById,
   getAffiliateById,
+  getScenarios,
+  enrollFriendInScenario,
   jstNow,
 } from '@line-crm/db';
 import { buildIntroMessage } from '../services/intro-message.js';
 import { attachTagAndFireSideEffects } from '../services/friend-tag-attach.js';
 import { pushImmediateFirstStep } from '../services/immediate-first-step.js';
 import { notifyAffiliateFriendAdd } from '../services/affiliate-notifier.js';
+import { verifyCallerLineUserId } from '../services/liff-auth.js';
+import { awardActivityMileage } from '../services/activity-mileage.js';
 import { safeRedirectTarget } from '../lib/safe-redirect.js';
+import { isReservedRef } from '../lib/reserved-refs.js';
+import { loginUnconfiguredPage } from '../lib/login-unconfigured.js';
 import { shouldSkipCompletedInitialDiagnosis } from '../services/initial-diagnosis-guard.js';
 import type { Env } from '../index.js';
+import { verifyCrossAccountToken } from '../lib/cross-account-token.js';
+
+
+// OAuth state base64 helpers. btoa() only accepts Latin-1, so a single
+// multibyte query param (e.g. utm_campaign=夏キャンペーン) used to throw
+// InvalidCharacterError and turn the whole /auth/line request into a 500.
+// Encode via UTF-8 bytes instead. decodeState is byte-compatible with
+// states produced by the old plain btoa (ASCII-only payloads).
+function encodeState(state: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(state)));
+}
+function decodeState(encoded: string): string {
+  return new TextDecoder().decode(Uint8Array.from(atob(encoded), (ch) => ch.charCodeAt(0)));
+}
 
 const liffRoutes = new Hono<Env>();
 
@@ -79,6 +101,17 @@ async function linkIgIgsid(
     );
     return false;
   }
+
+  // A successful IG -> LINE return is itself an engagement milestone. The
+  // stable identity/subject keys make repeated LIFF visits harmless.
+  await awardActivityMileage(c.env.DB, {
+    eventType: 'instagram_line_returned',
+    source: 'instagram',
+    sourceEventId: `${friendId}:${igParam}`,
+    friendId,
+    subjectKey: igParam,
+    metadata: { igsid: igParam },
+  });
 
   if (c.env.IG_HARNESS_URL && c.env.IG_HARNESS_LINK_SECRET) {
     c.executionCtx.waitUntil(
@@ -173,6 +206,11 @@ async function applyRefAttribution(
   options?: { accountChannelId?: string | null; isNewFriend?: boolean },
 ): Promise<void> {
   if (!ref || ref.startsWith('xh:')) return;
+  // Reserved product refs (e.g. 'dashboard') are provenance markers, never
+  // campaigns — skip route/tracked-link/affiliate side effects even when a
+  // tenant has a pre-existing row with that ref_code. friends.ref_code and
+  // ref_tracking writes happen in the callers and are unaffected.
+  if (isReservedRef(ref)) return;
   const db = c.env.DB;
 
   const route = await getEntryRouteByRefCode(db, ref);
@@ -303,28 +341,19 @@ liffRoutes.get('/auth/line', async (c) => {
 
   // Multi-account: resolve LINE Login channel + LIFF
   // Priority:
-  //   1. entry_route.pool_id (when ref resolves to a referral link)
-  //   2. ?account= explicit single-account override
+  //   1. ?account= explicit single-account pin — wins over ref-derived pools
+  //      so an admin-issued per-account link is never re-routed by a
+  //      colliding ref_code (the ref still rides along for attribution)
+  //   2. entry_route.pool_id (when ref resolves to a referral link)
   //   3. ?pool= explicit override
   //   4. 'main' traffic pool fallback
   //   5. env default
   let channelId = c.env.LINE_LOGIN_CHANNEL_ID;
   let liffUrl = c.env.LIFF_URL || '';
 
-  // 1. entry_route → pool_id. getTrafficPoolById skips the is_active check
-  // that getTrafficPoolBySlug does for us, so we filter disabled pools here
-  // to honor an operator pause.
-  let resolvedPool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
-  if (ref) {
-    const route = await getEntryRouteByRefCode(c.env.DB, ref);
-    if (route?.pool_id) {
-      const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
-      if (candidate?.is_active) resolvedPool = candidate;
-    }
-  }
-
-  if (!resolvedPool && accountParam) {
-    // 2. ?account= explicit override
+  // 1. ?account= explicit pin.
+  let accountResolved = false;
+  if (accountParam) {
     const account = await getLineAccountByChannelId(c.env.DB, accountParam);
     if (account?.login_channel_id) {
       channelId = account.login_channel_id;
@@ -332,6 +361,23 @@ liffRoutes.get('/auth/line', async (c) => {
     if (account?.liff_id) {
       liffUrl = `https://liff.line.me/${account.liff_id}`;
     }
+    accountResolved = Boolean(account?.login_channel_id || account?.liff_id);
+  }
+
+  // 2. entry_route → pool_id. getTrafficPoolById skips the is_active check
+  // that getTrafficPoolBySlug does for us, so we filter disabled pools here
+  // to honor an operator pause.
+  let resolvedPool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
+  if (ref && !accountResolved) {
+    const route = await getEntryRouteByRefCode(c.env.DB, ref);
+    if (route?.pool_id) {
+      const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
+      if (candidate?.is_active) resolvedPool = candidate;
+    }
+  }
+
+  if (accountResolved) {
+    // account pin already applied above — skip pool resolution entirely
   } else {
     // 3 / 4: pool lookup (entry_route.pool_id wins over query)
     if (!resolvedPool) {
@@ -358,6 +404,14 @@ liffRoutes.get('/auth/line', async (c) => {
       }
     }
   }
+  // L Harness Cloud tenants are provisioned without LINE Login / LIFF config.
+  // When neither env nor the resolved account/pool provides them, the code
+  // below crashes (`liffUrl.match()` on undefined) or sends
+  // client_id=undefined to access.line.me — fail with setup guidance instead.
+  if (!channelId) {
+    return c.html(loginUnconfiguredPage(), 503);
+  }
+
   const callbackUrl = `${baseUrl}/auth/callback`;
 
   // xh: refs are X Harness one-time tokens — never forward to third-party URLs (liff.line.me / QR)
@@ -399,7 +453,7 @@ liffRoutes.get('/auth/line', async (c) => {
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
   const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam, iga: igaParam, igan: iganParam, rt: refTrackingId });
-  const encodedState = btoa(state);
+  const encodedState = encodeState(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -431,6 +485,15 @@ liffRoutes.get('/auth/line', async (c) => {
   if (igParam) qrParams.set('ig', igParam);
   if (igaParam) qrParams.set('iga', igaParam);
   if (iganParam) qrParams.set('igan', iganParam);
+  // Ad click IDs + UTM — without these the PC/QR path loses ad attribution
+  // (same params /auth/line already reads for the OAuth state).
+  if (gclid) qrParams.set('gclid', gclid);
+  if (fbclid) qrParams.set('fbclid', fbclid);
+  if (twclid) qrParams.set('twclid', twclid);
+  if (ttclid) qrParams.set('ttclid', ttclid);
+  if (utmSource) qrParams.set('utm_source', utmSource);
+  if (utmMedium) qrParams.set('utm_medium', utmMedium);
+  if (utmCampaign) qrParams.set('utm_campaign', utmCampaign);
   const qrUrl = qrParams.toString() ? `${liffUrl}?${qrParams.toString()}` : liffUrl;
 
   // Mobile: route through /r/:ref so users get the OS-aware landing page
@@ -438,15 +501,24 @@ liffRoutes.get('/auth/line', async (c) => {
   // dropped onto liff.line.me directly. Direct liff.line.me redirects
   // surface LINE Login web for UL-未学習 devices, which kills conversion.
   // Exceptions:
-  //   - cross-account links (accountParam) → OAuth directly so the callback
-  //     can push from the correct account
+  //   - account links carrying callback-only state → OAuth. Three params can
+  //     only be honored by /auth/callback and are silently dropped on the
+  //     LIFF-direct path:
+  //       * uid   — cross-account UUID linking (the LIFF client never reads
+  //                 ?uid=; it only knows its own localStorage UUID)
+  //       * ref=xh: — X Harness one-time tokens ride the OAuth state and are
+  //                 deliberately stripped from external liff.line.me/QR URLs
+  //       * redirect — post-link redirect is not forwarded by qrUrl
+  //     Plain ?account= links go LIFF-direct instead: /api/liff/link resolves
+  //     the account from the verified id_token, so the OAuth web-login detour
+  //     added friction without adding correctness.
   //   - xh: refs (X Harness one-time tokens) → liff.line.me direct, since
   //     these tokens must NEVER appear in third-party URLs and the
   //     externalRef has already been zeroed for that case
   //   - empty ref → liff.line.me direct (no /r/:ref to route to)
   const isMobile = /iphone|ipad|android|mobile/.test(ua.toLowerCase());
   if (isMobile) {
-    if (accountParam) {
+    if (accountParam && (uidParam || redirect || ref.startsWith('xh:'))) {
       return c.redirect(loginUrl.toString());
     }
     if (externalRef && !fromRoute) {
@@ -510,23 +582,24 @@ liffRoutes.get('/auth/line', async (c) => {
  * Same query params as /auth/line. No HTML rendering, no smart logic.
  */
 liffRoutes.get('/auth/oauth', async (c) => {
-  const ref = c.req.query('ref') || '';
-  const redirect = c.req.query('redirect') || '';
-  const formId = c.req.query('form') || '';
-  const gateParam = c.req.query('gate') || '';
-  const xhParam = c.req.query('xh') || '';
-  const gclid = c.req.query('gclid') || '';
-  const fbclid = c.req.query('fbclid') || '';
-  const twclid = c.req.query('twclid') || '';
-  const ttclid = c.req.query('ttclid') || '';
-  const utmSource = c.req.query('utm_source') || '';
-  const utmMedium = c.req.query('utm_medium') || '';
-  const utmCampaign = c.req.query('utm_campaign') || '';
-  const accountParam = c.req.query('account') || '';
-  const uidParam = c.req.query('uid') || '';
-  const igParam = c.req.query('ig') || '';
-  const igaParam = c.req.query('iga') || '';
-  const iganParam = c.req.query('igan') || '';
+  const q = createLiffQueryReader((key) => c.req.query(key));
+  const ref = q('ref');
+  const redirect = q('redirect');
+  const formId = q('form');
+  const gateParam = q('gate');
+  const xhParam = q('xh');
+  const gclid = q('gclid');
+  const fbclid = q('fbclid');
+  const twclid = q('twclid');
+  const ttclid = q('ttclid');
+  const utmSource = q('utm_source');
+  const utmMedium = q('utm_medium');
+  const utmCampaign = q('utm_campaign');
+  const accountParam = q('account');
+  const uidParam = q('uid');
+  const igParam = q('ig');
+  const igaParam = q('iga');
+  const iganParam = q('igan');
   let poolAccount = '';
   const baseUrl = new URL(c.req.url).origin;
 
@@ -536,7 +609,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
     const account = await getLineAccountByChannelId(c.env.DB, accountParam);
     if (account?.login_channel_id) channelId = account.login_channel_id;
   } else {
-    const poolSlug = c.req.query('pool') || 'main';
+    const poolSlug = q('pool') || 'main';
     const pool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
     if (pool) {
       const account = await getRandomPoolAccount(c.env.DB, pool.id);
@@ -556,6 +629,12 @@ liffRoutes.get('/auth/oauth', async (c) => {
     }
   }
 
+  // Same guard as /auth/line — without a login channel the redirect would
+  // carry client_id=undefined and dead-end on a LINE error page.
+  if (!channelId) {
+    return c.html(loginUnconfiguredPage(), 503);
+  }
+
   // Build OAuth URL with full state
   const callbackUrl = `${baseUrl}/auth/callback`;
   const state = JSON.stringify({
@@ -565,7 +644,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
     account: accountParam || poolAccount, uid: uidParam, ig: igParam,
     iga: igaParam, igan: iganParam,
   });
-  const encodedState = btoa(state);
+  const encodedState = encodeState(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -607,7 +686,7 @@ liffRoutes.get('/auth/callback', async (c) => {
   let igaParam = '';
   let iganParam = '';
   try {
-    const parsed = JSON.parse(atob(stateParam));
+    const parsed = JSON.parse(decodeState(stateParam));
     ref = parsed.ref || '';
     redirect = parsed.redirect || '';
     formId = parsed.form || '';
@@ -647,6 +726,12 @@ liffRoutes.get('/auth/callback', async (c) => {
         loginChannelId = account.login_channel_id;
         loginChannelSecret = account.login_channel_secret;
       }
+    }
+
+    // Same guard as /auth/line — never attempt a token exchange with
+    // undefined credentials (unconfigured L Harness Cloud tenant).
+    if (!loginChannelId || !loginChannelSecret) {
+      return c.html(loginUnconfiguredPage(), 503);
     }
 
     // Exchange code for tokens
@@ -881,101 +966,53 @@ liffRoutes.get('/auth/callback', async (c) => {
       !referralRouteForOverride || referralRouteForOverride.run_account_friend_add_scenarios !== 0;
 
     try {
-      const { getScenarios, enrollFriendInScenario: enroll, getScenarioSteps } = await import('@line-crm/db');
-      const { LineClient } = await import('@line-crm/line-sdk');
-      const { buildMessage, expandVariables } = await import('../services/step-delivery.js');
-
       // Resolve which account this friend belongs to
       const matchedAccountId = accountParam
         ? (await getLineAccountByChannelId(db, accountParam))?.id ?? null
         : null;
 
-      // Get access token for this account
-      let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
-      if (accountParam) {
-        const acct = await getLineAccountByChannelId(db, accountParam);
-        if (acct) accessToken = acct.channel_access_token;
-      }
-      const lineClient = new LineClient(accessToken);
-
-      const {
-        computeNextDeliveryAt: computeNextLiff,
-        resolveStepContent: resolveStepLiff,
-        addTagToFriend: addTagLiff,
-      } = await import('@line-crm/db');
       const scenarios = runAccountScenariosLiff ? await getScenarios(db) : [];
       for (const scenario of scenarios) {
         const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
-        if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
-          if (await shouldSkipCompletedInitialDiagnosis(db, friend.id, scenario)) {
-            console.log(`[liff] skip completed initial diagnosis friend=${friend.id} scenario=${scenario.id}`);
-            continue;
-          }
-
-          const enrollment = await enroll(db, friend.id, scenario.id);
+        if (scenario.trigger_type !== 'friend_add' || !scenario.is_active || !scenarioAccountMatch) {
+          continue;
+        }
+        // Per-scenario isolation (matching the follow webhook's loop): one
+        // failing enroll/push must not skip the remaining scenarios.
+        try {
+          // Never re-enroll via the OAuth path. The friend_scenarios partial
+          // UNIQUE only blocks non-completed rows (WHERE status != 'completed'),
+          // so an existing friend re-running OAuth login (e.g. via a form link)
+          // would get a completed enrollment re-created and the welcome
+          // sequence re-sent. Re-sends on genuine re-adds (unblock → follow)
+          // are the follow webhook's job. Friends with no enrollment history
+          // (OAuth beat the webhook, message-first friends, migrated bases)
+          // still enroll here — this is their only friend_add entry.
+          const priorEnrollment = await db
+            .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ?`)
+            .bind(friend.id, scenario.id)
+            .first();
+          if (priorEnrollment) continue;
+          const enrollment = await enrollFriendInScenario(db, friend.id, scenario.id);
           if (enrollment) {
-            // 即時送信は scenario.delivery_mode を踏まえて「now 以前にスケジュールされる」場合のみ。
-            // (relative+0min / elapsed+0d0m / absolute_time の過去時刻)
-            const steps = await getScenarioSteps(db, scenario.id);
-            const firstStep = steps[0];
-            if (firstStep) {
-              const enrolledAtJst = new Date(Date.now() + 9 * 60 * 60_000);
-              const firstScheduledAt = computeNextLiff(
-                { delivery_mode: scenario.delivery_mode ?? 'relative' },
-                firstStep,
-                { enrolledAt: enrolledAtJst, previousDeliveredAt: enrolledAtJst, now: enrolledAtJst },
-              );
-              if (firstScheduledAt.getTime() <= enrolledAtJst.getTime()) {
-                // Resolve template_id → templates table (参照型)
-                const resolved = await resolveStepLiff(db, firstStep);
-                const { resolveMetadata: resolveMetaLiff, messageToLogPayload } = await import('../services/step-delivery.js');
-                const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-                const expandedContent = expandVariables(
-                  resolved.messageContent,
-                  { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
-                  c.env.WORKER_URL,
-                  resolved.messageType,
-                );
-                // 1:1 push → /t リンクに f=<friendId> を焼き込み (LIFF 識別ホップ回避)
-                const { appendFriendToTrackedLinks } = await import('../services/auto-track.js');
-                const decoratedContent = await appendFriendToTrackedLinks(
-                  db, expandedContent, c.env.WORKER_URL, friend.id,
-                );
-                const pushedMessage = buildMessage(resolved.messageType, decoratedContent);
-                await lineClient.pushMessage(lineUserId, [pushedMessage]);
-
-                // messages_log への記録 (到達率分母に含めるため)
-                const oauthLogPayload = messageToLogPayload(pushedMessage);
-                const nowIso = new Date(Date.now() + 9 * 60 * 60_000)
-                  .toISOString()
-                  .slice(0, -1) + '+09:00';
-                await db
-                  .prepare(
-                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, template_id_at_send, created_at)
-                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'scenario', ?, ?)`,
-                  )
-                  .bind(
-                    crypto.randomUUID(),
-                    friend.id,
-                    oauthLogPayload.messageType,
-                    oauthLogPayload.content,
-                    firstStep.id,
-                    resolved.templateIdAtSend,
-                    nowIso,
-                  )
-                  .run();
-
-                // 到達タグ付与 (push 後)
-                if (firstStep.on_reach_tag_id) {
-                  try {
-                    await addTagLiff(db, friend.id, firstStep.on_reach_tag_id);
-                  } catch (err) {
-                    console.error(`[scenario] tag attach failed step=${firstStep.id}:`, err);
-                  }
-                }
-              }
-            }
+            // Instant welcome via the unified service ('once' mode): claims
+            // the fresh row, then advances it so the cron never re-sends
+            // step 1. lineUserId comes from the verified id_token, so the
+            // push works even before friend.line_user_id is fully wired.
+            await pushImmediateFirstStep(
+              db,
+              friend.id,
+              scenario.id,
+              {
+                defaultAccessToken: c.env.LINE_CHANNEL_ACCESS_TOKEN,
+                workerUrl: c.env.WORKER_URL,
+                accountChannelId: accountParam || null,
+              },
+              { enrollment, targetLineUserId: lineUserId },
+            );
           }
+        } catch (err) {
+          console.error(`OAuth friend_add enrollment failed scenario=${scenario.id}:`, err);
         }
       }
     } catch (err) {
@@ -1145,15 +1182,15 @@ liffRoutes.get('/api/liff/config', async (c) => {
 
 // ─── Existing LIFF endpoints ────────────────────────────────────
 
-// POST /api/liff/profile - get friend by LINE userId (public, no auth)
+// POST /api/liff/profile - get the authenticated LIFF caller's friend profile
 liffRoutes.post('/api/liff/profile', async (c) => {
   try {
-    const body = await c.req.json<{ lineUserId: string }>();
-    if (!body.lineUserId) {
-      return c.json({ success: false, error: 'lineUserId is required' }, 400);
+    const lineUserId = await verifyCallerLineUserId(c.req.header('Authorization'), c.env);
+    if (!lineUserId) {
+      return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
 
-    const friend = await getFriendByLineUserId(c.env.DB, body.lineUserId);
+    const friend = await getFriendByLineUserId(c.env.DB, lineUserId);
     if (!friend) {
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
@@ -1181,6 +1218,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
       displayName?: string | null;
       ref?: string;
       existingUuid?: string;
+      crossAccountToken?: string;
       ig?: string;
       sourceUrl?: string;
       fbclid?: string;
@@ -1209,13 +1247,17 @@ liffRoutes.post('/api/liff/link', async (c) => {
     }
 
     let verifyRes: Response | null = null;
+    let matchedLoginChannelId: string | null = null;
     for (const channelId of loginChannelIds) {
       verifyRes = await fetch('https://api.line.me/oauth2/v2.1/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ id_token: body.idToken, client_id: channelId }),
       });
-      if (verifyRes.ok) break;
+      if (verifyRes.ok) {
+        matchedLoginChannelId = channelId;
+        break;
+      }
     }
 
     if (!verifyRes?.ok) {
@@ -1227,9 +1269,37 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const email = verified.email || null;
 
     const db = c.env.DB;
-    const friend = await getFriendByLineUserId(db, lineUserId);
+    // id_token を検証できたログインチャネル = ユーザーが開いている LIFF のアカウント。
+    // friend 行とプッシュ先をそのアカウントに揃える (同一プロバイダーの兄弟アカウント
+    // では line_user_id が同一で、無指定の先頭一致だと別アカウントに吸われるため)。
+    const matchedAccount = matchedLoginChannelId
+      ? dbAccounts.find((a) => a.login_channel_id === matchedLoginChannelId) ?? null
+      : null;
+    const friend = await getFriendByLineUserIdForAccount(
+      db, lineUserId, matchedAccount?.id ?? null,
+    );
     if (!friend) {
       return c.json({ success: false, error: 'Friend not found' }, 404);
+    }
+
+    let linkedUserId = (friend as unknown as Record<string, unknown>).user_id as string | null;
+    if (body.crossAccountToken) {
+      const crossAccount = await verifyCrossAccountToken(
+        c.env.LINE_CHANNEL_SECRET,
+        body.crossAccountToken,
+      );
+      if (!crossAccount || !matchedAccount || crossAccount.targetAccountId !== matchedAccount.id) {
+        return c.json({ success: false, error: 'Invalid cross-account token' }, 400);
+      }
+      const targetUser = await db
+        .prepare('SELECT id FROM users WHERE id = ?')
+        .bind(crossAccount.userId)
+        .first<{ id: string }>();
+      if (!targetUser) {
+        return c.json({ success: false, error: 'Cross-account user not found' }, 400);
+      }
+      await linkFriendToUser(db, friend.id, crossAccount.userId);
+      linkedUserId = crossAccount.userId;
     }
 
     // IG cross-link: runs regardless of already-linked vs new-link branch so
@@ -1238,7 +1308,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const igLinkOk = await linkIgIgsid(c, friend.id, body.ig || '');
     if (igLinkOk) await saveIgAccountMeta(db, friend.id, body.iga || '', body.igan || '');
 
-    if ((friend as unknown as Record<string, unknown>).user_id) {
+    if (linkedUserId) {
       // Still save ref even if already linked (but never persist xh: tokens as ref_code)
       if (body.ref && !body.ref.startsWith('xh:')) {
         await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
@@ -1290,7 +1360,9 @@ liffRoutes.post('/api/liff/link', async (c) => {
         } catch { /* silent */ }
       }
       if (body.ref) {
-        await applyRefAttribution(c, body.ref, friend, lineUserId);
+        await applyRefAttribution(c, body.ref, friend, lineUserId, {
+          accountChannelId: matchedAccount?.channel_id ?? null,
+        });
       }
       // X Harness token resolution for already-linked friends
       if (body.ref && body.ref.startsWith('xh:')) {
@@ -1319,7 +1391,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
       }
       return c.json({
         success: true,
-        data: { userId: (friend as unknown as Record<string, unknown>).user_id, alreadyLinked: true },
+        data: { userId: linkedUserId, alreadyLinked: true },
       });
     }
 
@@ -1386,7 +1458,9 @@ liffRoutes.post('/api/liff/link', async (c) => {
       } catch { /* silent */ }
 
       // Apply ref attribution (tag + scenario push) for newly-linked friends
-      await applyRefAttribution(c, body.ref, friend, lineUserId);
+      await applyRefAttribution(c, body.ref, friend, lineUserId, {
+        accountChannelId: matchedAccount?.channel_id ?? null,
+      });
     }
 
     // X Harness token resolution: ref starting with "xh:" links X account to LINE friend
