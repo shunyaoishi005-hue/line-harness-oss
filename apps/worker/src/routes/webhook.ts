@@ -477,6 +477,7 @@ async function handleEvent(
       id: string;
       type: string;
       fileName?: string;
+      fileSize?: number;
       title?: string;
       packageId?: string | number;
       package_id?: string | number;
@@ -518,6 +519,25 @@ async function handleEvent(
         finalContent = JSON.stringify(refs);
       }
     }
+    // file (PDF 等) も同様に Content API → R2 → JSON ({fileName,url,size,contentType}) に置換。
+    // 失敗時は `[ファイル: 名前]` ラベルのまま。
+    let storedFileUrl: string | null = null;
+    if (msg.type === 'file' && r2 && workerUrl) {
+      const { fetchAndStoreIncomingFile } = await import('../services/incoming-image.js');
+      const refs = await fetchAndStoreIncomingFile({
+        r2,
+        workerUrl,
+        channelAccessToken: lineAccessToken,
+        accountId: lineAccountId ?? 'unknown',
+        messageId: msg.id,
+        fileName: msg.fileName,
+        fileSize: msg.fileSize,
+      });
+      if (refs) {
+        finalContent = JSON.stringify(refs);
+        storedFileUrl = refs.url;
+      }
+    }
 
     await db
       .prepare(
@@ -531,6 +551,30 @@ async function handleEvent(
     // 画像だけ送ってきた友だち」をバッジ・未対応一覧から永久に落としてしまう。
     // 非 text は auto_reply keyword にマッチし得ないので常に要対応扱いで正しい。
     await upsertChatOnMessage(db, friend.id);
+
+    // イベントバス発火: file_received (画像・ファイルの受信)。
+    // message_received とは分けることで「テキスト全般 → 対応中タグ」のような
+    // catch-all ルールに巻き込まれず、資料受領の自動化 (タグ付与・シナリオ開始・
+    // 担当通知) を file_received トリガーで独立して組める。
+    if (msg.type === 'image' || msg.type === 'file') {
+      if (msg.type === 'image' && finalContent.startsWith('{')) {
+        try {
+          storedFileUrl = (JSON.parse(finalContent) as { originalContentUrl?: string }).originalContentUrl ?? null;
+        } catch {
+          storedFileUrl = null;
+        }
+      }
+      await fireEvent(db, 'file_received', {
+        friendId: friend.id,
+        eventData: {
+          text: '__file__',
+          messageType: msg.type,
+          fileName: msg.fileName ?? null,
+          fileUrl: storedFileUrl,
+        },
+        replyToken: event.replyToken,
+      }, lineAccessToken, lineAccountId);
+    }
     return;
   }
 

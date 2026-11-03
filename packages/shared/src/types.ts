@@ -809,6 +809,7 @@ export type AutomationEventType =
   | "score_threshold"
   | "cv_fire"
   | "message_received"
+  | "file_received"
   | "calendar_booked";
 
 export interface AutomationAction {

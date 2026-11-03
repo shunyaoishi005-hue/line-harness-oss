@@ -1097,6 +1097,24 @@ export default function ChatsPage() {
                       } catch {
                         bubbleContent = <span>🖼️ [画像]</span>
                       }
+                    } else if (msg.messageType === 'file') {
+                      // incoming file (PDF 等) は webhook 側で {fileName,url,size,contentType} の JSON に置換される。
+                      // 取得に失敗した場合は `[ファイル: 名前]` のラベル文字列のまま。
+                      let fileRefs: { fileName?: string; url?: string; size?: number } | null = null
+                      try {
+                        const parsed = JSON.parse(msg.content)
+                        if (parsed && typeof parsed === 'object' && typeof parsed.url === 'string') fileRefs = parsed
+                      } catch {
+                        fileRefs = null
+                      }
+                      bubbleContent = fileRefs?.url ? (
+                        <a href={fileRefs.url} target="_blank" rel="noreferrer" className="underline break-all">
+                          📎 {fileRefs.fileName || 'ファイル'}
+                          {fileRefs.size ? ` (${Math.max(1, Math.round(fileRefs.size / 1024))}KB)` : ''} を開く
+                        </a>
+                      ) : (
+                        <span>📎 {msg.content}</span>
+                      )
                     } else if (msg.messageType === 'sticker') {
                       bubbleContent = <StickerMessageImage content={msg.content} />
                     } else {
