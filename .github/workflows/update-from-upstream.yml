@@ -30,8 +30,16 @@ jobs:
 
       - name: Detect upstream changes
         id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if git merge-base --is-ancestor upstream/main HEAD; then
+          # 取り込みPRが開いたままなら、同じ内容のPRを毎日増やさない
+          open_prs=$(gh pr list --repo "${{ github.repository }}" --state open --base main \
+            --json headRefName --jq '[.[] | select(.headRefName | startswith("upstream/update-"))] | length')
+          if [ "$open_prs" -gt 0 ]; then
+            echo "An upstream update PR is already open; skipping."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor upstream/main HEAD; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -60,7 +68,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # upstreamリモートがあるとghが本家を既定リポジトリにするため、自リポジトリを明示
           gh pr create \
+            --repo "${{ github.repository }}" \
             --base main \
             --head "${{ steps.branch.outputs.name }}" \
             --title "chore: update from upstream" \
