@@ -1,6 +1,8 @@
 import { Hono, type Context } from 'hono';
+import { resolveIgLink, type ResolvedIgLink } from '../lib/ig-link.js';
 import { createLiffQueryReader } from '../lib/liff-query.js';
 import {
+  claimIgLinkToken,
   getFriendByLineUserId,
   getFriendByLineUserIdForAccount,
   createUser,
@@ -61,14 +63,27 @@ const liffRoutes = new Hono<Env>();
 // Returns whether the friend is linked to THIS IGSID after the call (true
 // when written or already identical; false on conflict/error). Callers use
 // the verdict to gate IG-account metadata writes so metadata can't claim an
-// account that contradicts the stored ig_igsid. An empty igParam returns
-// true: no IGSID means no conflict evidence.
+// account that contradicts the stored ig_igsid. A rejected resolution returns
+// false; an absent legacy IGSID preserves metadata-only attribution in off/prefer.
 async function linkIgIgsid(
   c: Context<Env>,
   friendId: string,
-  igParam: string,
+  link: ResolvedIgLink | null,
 ): Promise<boolean> {
+  if (!link) return false;
+  const igParam = link.igsid;
   if (!igParam) return true;
+  if (c.env.IG_LINK_TOKEN_POLICY === 'require') {
+    try {
+      if (!link.token || !await claimIgLinkToken(c.env.DB, link.token.n, friendId, link.token.exp)) {
+        console.warn('[ig-link] replay_rejected');
+        return false;
+      }
+    } catch {
+      console.warn('[ig-link] replay_storage_unavailable');
+      return false;
+    }
+  }
 
   // Only notify IG Harness if this friend is actually linked to this IGSID
   // locally. Writing LINE→IG first then gating the IG→LINE notify prevents
@@ -104,7 +119,7 @@ async function linkIgIgsid(
 
   // A successful IG -> LINE return is itself an engagement milestone. The
   // stable identity/subject keys make repeated LIFF visits harmless.
-  await awardActivityMileage(c.env.DB, {
+  if (link.awardMileage) await awardActivityMileage(c.env.DB, {
     eventType: 'instagram_line_returned',
     source: 'instagram',
     sourceEventId: `${friendId}:${igParam}`,
@@ -330,6 +345,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const refTrackingId = c.req.query('rt') || '';
   let accountParam = c.req.query('account') || '';
   const uidParam = c.req.query('uid') || ''; // existing user UUID for cross-account linking
+  const igtParam = c.req.query('igt');
   const igParam = c.req.query('ig') || ''; // IG Harness IGSID for cross-platform linking
   const igaParam = c.req.query('iga') || ''; // IG Harness business account id
   const iganParam = c.req.query('igan') || ''; // IG Harness business account @username
@@ -431,6 +447,7 @@ liffRoutes.get('/auth/line', async (c) => {
   if (gateParam) liffParams.set('gate', gateParam);
   const xhParam2 = c.req.query('xh') || '';
   if (xhParam2) liffParams.set('xh', xhParam2);
+  if (igtParam !== undefined) liffParams.set('igt', igtParam);
   if (igParam) liffParams.set('ig', igParam);
   if (igaParam) liffParams.set('iga', igaParam);
   if (iganParam) liffParams.set('igan', iganParam);
@@ -452,7 +469,7 @@ liffRoutes.get('/auth/line', async (c) => {
   // can verify against the correct gate via the correct X Harness instance.
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
-  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam, iga: igaParam, igan: iganParam, rt: refTrackingId });
+  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, igt: igtParam, ig: igParam, iga: igaParam, igan: iganParam, rt: refTrackingId });
   const encodedState = encodeState(state);
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
@@ -482,6 +499,7 @@ liffRoutes.get('/auth/line', async (c) => {
   if (xhParam2) qrParams.set('xh', xhParam2);
   if (uidParam) qrParams.set('uid', uidParam);
   if (accountParam) qrParams.set('account', accountParam);
+  if (igtParam !== undefined) qrParams.set('igt', igtParam);
   if (igParam) qrParams.set('ig', igParam);
   if (igaParam) qrParams.set('iga', igaParam);
   if (iganParam) qrParams.set('igan', iganParam);
@@ -597,6 +615,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
   const utmCampaign = q('utm_campaign');
   const accountParam = q('account');
   const uidParam = q('uid');
+  const igtParam = q.optional('igt');
   const igParam = q('ig');
   const igaParam = q('iga');
   const iganParam = q('igan');
@@ -641,7 +660,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
     ref, redirect, form: formId, gate: gateParam, xh: xhParam,
     gclid, fbclid, twclid, ttclid,
     utmSource, utmMedium, utmCampaign,
-    account: accountParam || poolAccount, uid: uidParam, ig: igParam,
+    account: accountParam || poolAccount, uid: uidParam, igt: igtParam, ig: igParam,
     iga: igaParam, igan: iganParam,
   });
   const encodedState = encodeState(state);
@@ -681,6 +700,7 @@ liffRoutes.get('/auth/callback', async (c) => {
   let utmCampaign = '';
   let accountParam = '';
   let uidParam = '';
+  let igtParam: unknown;
   let igParam = '';
   let refTrackingId = '';
   let igaParam = '';
@@ -703,6 +723,7 @@ liffRoutes.get('/auth/callback', async (c) => {
     uidParam = parsed.uid || '';
     igParam = parsed.ig || '';
     refTrackingId = parsed.rt || '';
+    igtParam = parsed.igt;
     igaParam = parsed.iga || '';
     iganParam = parsed.igan || '';
   } catch {
@@ -817,8 +838,9 @@ liffRoutes.get('/auth/callback', async (c) => {
     // IG cross-platform UUID linkage (OAuth path — new friends & returning users
     // going through /auth/callback). Existing friends who bypass OAuth hit the
     // same helper from /api/liff/link and /api/liff/send-form-link.
-    const igLinkOk = await linkIgIgsid(c, friend.id, igParam);
-    if (igLinkOk) await saveIgAccountMeta(db, friend.id, igaParam, iganParam);
+    const igLink = await resolveIgLink(c.env, { ig: igParam, igt: igtParam });
+    const igLinkOk = await linkIgIgsid(c, friend.id, igLink);
+    if (igLinkOk) await saveIgAccountMeta(db, friend.id, igLink?.token ? igLink.token.iga || '' : igaParam, iganParam);
 
     // Create or find user → link
     let userId: string | null = null;
@@ -1229,6 +1251,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
       utmMedium?: string;
       utmCampaign?: string;
       refTrackingId?: string;
+      igt?: string;
       iga?: string;
       igan?: string;
     }>();
@@ -1305,8 +1328,9 @@ liffRoutes.post('/api/liff/link', async (c) => {
     // IG cross-link: runs regardless of already-linked vs new-link branch so
     // existing friends still get ig_igsid wired when they hit this endpoint
     // from a reward DM.
-    const igLinkOk = await linkIgIgsid(c, friend.id, body.ig || '');
-    if (igLinkOk) await saveIgAccountMeta(db, friend.id, body.iga || '', body.igan || '');
+    const igLink = await resolveIgLink(c.env, body);
+    const igLinkOk = await linkIgIgsid(c, friend.id, igLink);
+    if (igLinkOk) await saveIgAccountMeta(db, friend.id, igLink?.token ? igLink.token.iga || '' : body.iga || '', body.igan || '');
 
     if (linkedUserId) {
       // Still save ref even if already linked (but never persist xh: tokens as ref_code)
@@ -1920,7 +1944,7 @@ async function resolveXHarnessToken(
 // Security: requires idToken to verify the caller is the actual LINE user
 liffRoutes.post('/api/liff/send-form-link', async (c) => {
   try {
-    const { lineUserId, formId, idToken, ref, gate, xh, ig, iga, igan } = await c.req.json<{
+    const { lineUserId, formId, idToken, ref, gate, xh, ig, igt, iga, igan } = await c.req.json<{
       lineUserId: string;
       formId: string;
       idToken?: string;
@@ -1928,6 +1952,7 @@ liffRoutes.post('/api/liff/send-form-link', async (c) => {
       gate?: string;
       xh?: string;
       ig?: string;
+      igt?: string;
       iga?: string;
       igan?: string;
     }>();
@@ -1979,8 +2004,9 @@ liffRoutes.post('/api/liff/send-form-link', async (c) => {
 
     // IG cross-link for LIFF flows that hit this endpoint (existing friends
     // tapping a reward DM URL).
-    const igLinkOk = await linkIgIgsid(c, friend.id, ig || '');
-    if (igLinkOk) await saveIgAccountMeta(db, friend.id, iga || '', igan || '');
+    const igLink = await resolveIgLink(c.env, { ig, igt });
+    const igLinkOk = await linkIgIgsid(c, friend.id, igLink);
+    if (igLinkOk) await saveIgAccountMeta(db, friend.id, igLink?.token ? igLink.token.iga || '' : iga || '', igan || '');
 
     // Build form LIFF URL using the friend's account liff_id (multi-account aware)
     // Append gate/xh so the form can verify against the correct campaign gate
